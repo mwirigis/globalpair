@@ -1,0 +1,2770 @@
+<?php
+/**
+ * GlobePair - Online Dating Platform
+ * Complete Single File Application
+ * Built with Pure PHP, Bootstrap 5, SQLite & RedBeanPHP
+ */
+
+// ==================== CONFIGURATION ====================
+require 'rb.php';
+
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
+date_default_timezone_set('Africa/Nairobi');
+
+// Database Setup
+define('DB_PATH', __DIR__ . '/globepair.sqlite');
+define('SITE_NAME', 'GlobePair - Find Your Perfect Match');
+define('SITE_URL', 'https://globepair.com');
+define('UPLOAD_DIR', __DIR__ . '/uploads/');
+define('MAX_FILE_SIZE', 5 * 1024 * 1024); // 5MB
+define('ALLOWED_TYPES', ['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+// ==================== PAYMENT CONFIGURATION ====================
+define('MESSAGE_FEE_KES', 200);
+define('MESSAGE_FEE_USD', 2);
+define('PREMIUM_PRICE', 1500);
+
+// ==================== M-PESA CONFIGURATION ====================
+// ADD YOUR M-PESA CREDENTIALS HERE
+define('MPESA_PAYBILL', 'YOUR_PAYBILL_NUMBER'); // Your Paybill/Till number
+define('MPESA_CONSUMER_KEY', 'YOUR_CONSUMER_KEY_HERE'); // Add your consumer key
+define('MPESA_CONSUMER_SECRET', 'YOUR_CONSUMER_SECRET_HERE'); // Add your consumer secret
+define('MPESA_PASSKEY', 'YOUR_PASSKEY_HERE'); // Add your passkey
+define('MPESA_SHORTCODE', 'YOUR_SHORTCODE_HERE'); // Your business shortcode
+// Updated to point directly to index.php so no external callback file is needed
+define('MPESA_CALLBACK_URL', SITE_URL . '/index.php?action=mpesa_callback'); 
+define('MPESA_SANDBOX', true); // Set to false for production
+
+// ==================== PAYPAL CONFIGURATION ====================
+// ADD YOUR PAYPAL CREDENTIALS HERE
+define('PAYPAL_CLIENT_ID', 'YOUR_PAYPAL_CLIENT_ID_HERE'); // Add your PayPal client ID
+define('PAYPAL_CLIENT_SECRET', 'YOUR_PAYPAL_CLIENT_SECRET_HERE'); // Add your PayPal secret
+define('PAYPAL_MODE', 'sandbox'); // Change to 'live' for production
+define('PAYPAL_CURRENCY', 'USD');
+
+// Admin Configuration
+define('ADMIN_EMAIL', 'admin@globepair.com');
+
+// Database Connection
+try {
+    R::setup('sqlite:' . DB_PATH);
+    R::freeze(true);
+    if (!R::testConnection()) {
+        throw new Exception('Database connection failed');
+    }
+} catch (Exception $e) {
+    die('Database Error: ' . $e->getMessage());
+}
+
+// Create uploads and logs directory
+if (!is_dir(UPLOAD_DIR)) {
+    mkdir(UPLOAD_DIR, 0755, true);
+}
+if (!is_dir(__DIR__ . '/logs')) {
+    mkdir(__DIR__ . '/logs', 0755, true);
+}
+
+// ==================== HELPER FUNCTIONS ====================
+function sanitize($input) {
+    return htmlspecialchars(trim($input), ENT_QUOTES, 'UTF-8');
+}
+
+function getCurrentUser() {
+    return isset($_SESSION['user_id']) ? R::load('user', $_SESSION['user_id']) : null;
+}
+
+function isLoggedIn() {
+    return isset($_SESSION['user_id']);
+}
+
+function isAdmin() {
+    $user = getCurrentUser();
+    return $user && $user->is_admin == 1;
+}
+
+function requireLogin() {
+    if (!isLoggedIn()) {
+        $_SESSION['redirect'] = $_SERVER['REQUEST_URI'];
+        header('Location: ?action=login');
+        exit;
+    }
+}
+
+function requireAdmin() {
+    if (!isAdmin()) {
+        $_SESSION['error'] = 'Access denied. Admin only.';
+        header('Location: ?action=home');
+        exit;
+    }
+}
+
+function generateCSRFToken() {
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function verifyCSRFToken($token) {
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
+}
+
+function handlePhotoUpload($file, $user_id = null) {
+    if (!isset($file) || $file['error'] !== UPLOAD_ERR_OK) {
+        return null;
+    }
+    
+    if ($file['size'] > MAX_FILE_SIZE) {
+        return ['error' => 'File size must be less than 5MB'];
+    }
+    
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    $mime_type = finfo_file($finfo, $file['tmp_name']);
+    finfo_close($finfo);
+    
+    if (!in_array($mime_type, ALLOWED_TYPES)) {
+        return ['error' => 'Invalid file type. Allowed: JPG, PNG, GIF, WebP'];
+    }
+    
+    $extension = '';
+    switch ($mime_type) {
+        case 'image/jpeg': $extension = '.jpg'; break;
+        case 'image/png': $extension = '.png'; break;
+        case 'image/gif': $extension = '.gif'; break;
+        case 'image/webp': $extension = '.webp'; break;
+    }
+    
+    $filename = ($user_id ? 'user_' . $user_id : 'temp_' . uniqid()) . '_' . time() . $extension;
+    $destination = UPLOAD_DIR . $filename;
+    
+    if (move_uploaded_file($file['tmp_name'], $destination)) {
+        return 'uploads/' . $filename;
+    }
+    
+    return ['error' => 'Failed to upload file'];
+}
+
+function canSendMessage($from_user, $to_user) {
+    // Both premium can message each other
+    if ($from_user->user_role === 'premium' && $to_user->user_role === 'premium') {
+        return true;
+    }
+    
+    // Check if user has paid message fee
+    $payment = R::findOne('messagepayment', 'user_id = ? AND status = ? AND expires_at > ?', 
+        [$from_user->id, 'completed', date('Y-m-d H:i:s')]);
+    
+    return (bool)$payment;
+}
+
+function getMpesaAccessToken() {
+    $url = MPESA_SANDBOX ? 
+        'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials' :
+        'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials';
+    
+    $credentials = base64_encode(MPESA_CONSUMER_KEY . ':' . MPESA_CONSUMER_SECRET);
+    
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Authorization: Basic ' . $credentials]);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    
+    $response = curl_exec($ch);
+    curl_close($ch);
+    
+    $result = json_decode($response);
+    return $result->access_token ?? null;
+}
+
+function initiateMpesaSTKPush($phone, $amount, $reference) {
+    $access_token = getMpesaAccessToken();
+    if (!$access_token) {
+        return ['success' => false, 'error' => 'Failed to get M-Pesa access token'];
+    }
+    
+    $timestamp = date('YmdHis');
+    $password = base64_encode(MPESA_SHORTCODE . MPESA_PASSKEY . $timestamp);
+    
+    $url = MPESA_SANDBOX ?
+        'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest' :
+        'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
+    
+    $data = [
+        'BusinessShortCode' => MPESA_SHORTCODE,
+        'Password' => $password,
+        'Timestamp' => $timestamp,
+        'TransactionType' => 'CustomerPayBillOnline',
+        'Amount' => $amount,
+        'PartyA' => $phone,
+        'PartyB' => MPESA_PAYBILL,
+        'PhoneNumber' => $phone,
+        'CallBackURL' => MPESA_CALLBACK_URL,
+        'AccountReference' => $reference,
+        'TransactionDesc' => 'GlobePair Payment'
+    ];
+    
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Authorization: Bearer ' . $access_token,
+        'Content-Type: application/json'
+    ]);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    
+    $response = curl_exec($ch);
+    curl_close($ch);
+    
+    $result = json_decode($response);
+    
+    if (isset($result->ResponseCode) && $result->ResponseCode === '0') {
+        return [
+            'success' => true,
+            'checkout_request_id' => $result->CheckoutRequestID,
+            'merchant_request_id' => $result->MerchantRequestID
+        ];
+    }
+    
+    return ['success' => false, 'error' => $result->errorMessage ?? 'M-Pesa request failed'];
+}
+
+function getPayPalAccessToken() {
+    $url = PAYPAL_MODE === 'sandbox' ?
+        'https://api-m.sandbox.paypal.com/v1/oauth2/token' :
+        'https://api-m.paypal.com/v1/oauth2/token';
+    
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, 'grant_type=client_credentials');
+    curl_setopt($ch, CURLOPT_USERPWD, PAYPAL_CLIENT_ID . ':' . PAYPAL_CLIENT_SECRET);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Accept: application/json']);
+    
+    $response = curl_exec($ch);
+    curl_close($ch);
+    
+    $result = json_decode($response);
+    return $result->access_token ?? null;
+}
+
+function createPayPalOrder($amount, $reference) {
+    $access_token = getPayPalAccessToken();
+    if (!$access_token) {
+        return ['success' => false, 'error' => 'Failed to get PayPal access token'];
+    }
+    
+    $url = PAYPAL_MODE === 'sandbox' ?
+        'https://api-m.sandbox.paypal.com/v2/checkout/orders' :
+        'https://api-m.paypal.com/v2/checkout/orders';
+    
+    $data = [
+        'intent' => 'CAPTURE',
+        'purchase_units' => [[
+            'reference_id' => $reference,
+            'amount' => [
+                'currency_code' => PAYPAL_CURRENCY,
+                'value' => $amount
+            ],
+            'description' => 'GlobePair Message Fee'
+        ]]
+    ];
+    
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Authorization: Bearer ' . $access_token,
+        'Content-Type: application/json'
+    ]);
+    
+    $response = curl_exec($ch);
+    curl_close($ch);
+    
+    $result = json_decode($response);
+    
+    if (isset($result->id)) {
+        // Find approve link
+        foreach ($result->links as $link) {
+            if ($link->rel === 'approve') {
+                return [
+                    'success' => true,
+                    'order_id' => $result->id,
+                    'approve_url' => $link->href
+                ];
+            }
+        }
+        return [
+            'success' => true,
+            'order_id' => $result->id,
+            'approve_url' => null
+        ];
+    }
+    
+    return ['success' => false, 'error' => $result->message ?? 'PayPal order creation failed'];
+}
+
+function capturePayPalOrder($order_id) {
+    $access_token = getPayPalAccessToken();
+    if (!$access_token) {
+        return ['success' => false, 'error' => 'Failed to get PayPal access token'];
+    }
+    
+    $url = (PAYPAL_MODE === 'sandbox' ?
+        'https://api-m.sandbox.paypal.com/v2/checkout/orders/' :
+        'https://api-m.paypal.com/v2/checkout/orders/') . $order_id . '/capture';
+    
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Authorization: Bearer ' . $access_token,
+        'Content-Type: application/json'
+    ]);
+    
+    $response = curl_exec($ch);
+    curl_close($ch);
+    
+    $result = json_decode($response);
+    
+    if (isset($result->status) && $result->status === 'COMPLETED') {
+        return ['success' => true, 'transaction_id' => $result->purchase_units[0]->payments->captures[0]->id ?? null];
+    }
+    
+    return ['success' => false, 'error' => $result->message ?? 'PayPal capture failed'];
+}
+
+// ==================== ROUTE HANDLING ====================
+$action = $_GET['action'] ?? 'home';
+
+// ==================== M-PESA CALLBACK HANDLER (API ENDPOINT) ====================
+if ($action === 'mpesa_callback') {
+    // This intercepts the request from Safaricom, updates the database, and exits 
+    // before any HTML is rendered, ensuring Safaricom gets a clean JSON response.
+    $rawData = file_get_contents('php://input');
+    $logFile = __DIR__ . '/logs/mpesa_callback.log';
+    
+    // Log the incoming payload for debugging
+    file_put_contents($logFile, date('Y-m-d H:i:s') . " - Received: " . $rawData . "\n\n", FILE_APPEND);
+    
+    $data = json_decode($rawData, true);
+
+    if (isset($data['Body']['stkCallback'])) {
+        $callback = $data['Body']['stkCallback'];
+        $checkoutId = $callback['CheckoutRequestID'] ?? null;
+        $resultCode = $callback['ResultCode'] ?? 1;
+        
+        if ($checkoutId) {
+            // Try to find in premium payments first
+            $payment = R::findOne('payment', 'checkout_request_id = ?', [$checkoutId]);
+            
+            // If not found, check message payments
+            if (!$payment) {
+                $payment = R::findOne('messagepayment', 'checkout_request_id = ?', [$checkoutId]);
+            }
+            
+            if ($payment && $payment->id) {
+                // ResultCode 0 means success
+                if ($resultCode == 0) {
+                    $mpesaReceipt = '';
+                    if (isset($callback['CallbackMetadata']['Item'])) {
+                        foreach ($callback['CallbackMetadata']['Item'] as $item) {
+                            if ($item['Name'] == 'MpesaReceiptNumber') {
+                                $mpesaReceipt = $item['Value'];
+                            }
+                        }
+                    }
+                    
+                    $payment->status = 'completed';
+                    $payment->mpesa_receipt = $mpesaReceipt;
+                    $payment->completed_at = date('Y-m-d H:i:s');
+                    
+                    // Check if this was a premium upgrade payment
+                    $isPremium = (isset($payment->payment_type) && $payment->payment_type == 'premium');
+                    
+                    R::store($payment);
+                    
+                    // Upgrade user if it was a premium payment
+                    if ($isPremium) {
+                        $user = R::load('user', $payment->user_id);
+                        if ($user->id) {
+                            $user->user_role = 'premium';
+                            $user->premium_until = date('Y-m-d', strtotime('+30 days'));
+                            R::store($user);
+                        }
+                    }
+                    file_put_contents($logFile, date('Y-m-d H:i:s') . " - SUCCESS: Receipt {$mpesaReceipt}\n\n", FILE_APPEND);
+                } else {
+                    // Payment failed (e.g., user cancelled, insufficient funds)
+                    $payment->status = 'failed';
+                    R::store($payment);
+                    file_put_contents($logFile, date('Y-m-d H:i:s') . " - FAILED: Code {$resultCode}\n\n", FILE_APPEND);
+                }
+            } else {
+                file_put_contents($logFile, date('Y-m-d H:i:s') . " - WARNING: CheckoutID not found in DB.\n\n", FILE_APPEND);
+            }
+        }
+    } else {
+        file_put_contents($logFile, date('Y-m-d H:i:s') . " - ERROR: Invalid callback format.\n\n", FILE_APPEND);
+    }
+
+    // Safaricom requires this exact JSON response to stop retrying the callback
+    http_response_code(200);
+    echo json_encode(['ResultCode' => 0, 'ResultDesc' => 'Accepted']);
+    exit; // Prevent any HTML from being outputted
+}
+
+$current_user = getCurrentUser();
+$page_title = 'GlobePair - Find Your Perfect Match';
+
+// Initialize database on first run
+if (!file_exists(DB_PATH)) {
+    initializeDatabase();
+}
+
+function initializeDatabase() {
+    // Create admin user
+    $admin = R::dispense('user');
+    $admin->email = 'admin@globepair.com';
+    $admin->password = password_hash('admin123', PASSWORD_BCRYPT);
+    $admin->first_name = 'Admin';
+    $admin->last_name = 'User';
+    $admin->city = 'Nairobi';
+    $admin->bio = 'Platform Administrator';
+    $admin->birth_date = '1990-01-01';
+    $admin->gender = 'other';
+    $admin->user_role = 'premium';
+    $admin->is_admin = 1;
+    $admin->status = 'active';
+    $admin->created_at = date('Y-m-d H:i:s');
+    $admin->updated_at = date('Y-m-d H:i:s');
+    R::store($admin);
+
+    // Create sample users
+    $users = [
+        ['email' => 'alice@globepair.com', 'password' => password_hash('alice123', PASSWORD_BCRYPT), 'first_name' => 'Alice', 'last_name' => 'Johnson', 'city' => 'Nairobi', 'bio' => 'Adventure lover & coffee enthusiast. Looking for someone who enjoys outdoor activities and good conversations.', 'birth_date' => '1995-03-15', 'gender' => 'female', 'user_role' => 'premium', 'status' => 'active'],
+        ['email' => 'bob@globepair.com', 'password' => password_hash('bob123', PASSWORD_BCRYPT), 'first_name' => 'Bob', 'last_name' => 'Smith', 'city' => 'Nairobi', 'bio' => 'Software engineer & photography hobbyist. Love capturing beautiful moments.', 'birth_date' => '1993-07-22', 'gender' => 'male', 'user_role' => 'premium', 'status' => 'active'],
+        ['email' => 'carol@globepair.com', 'password' => password_hash('carol123', PASSWORD_BCRYPT), 'first_name' => 'Carol', 'last_name' => 'Williams', 'city' => 'Mombasa', 'bio' => 'Yoga instructor & beach lover. Life is better at the beach!', 'birth_date' => '1998-11-08', 'gender' => 'female', 'user_role' => 'regular', 'status' => 'active'],
+        ['email' => 'david@globepair.com', 'password' => password_hash('david123', PASSWORD_BCRYPT), 'first_name' => 'David', 'last_name' => 'Brown', 'city' => 'Kisumu', 'bio' => 'Entrepreneur & traveler. Been to 15 countries and counting.', 'birth_date' => '1991-05-30', 'gender' => 'male', 'user_role' => 'regular', 'status' => 'active'],
+        ['email' => 'emma@globepair.com', 'password' => password_hash('emma123', PASSWORD_BCRYPT), 'first_name' => 'Emma', 'last_name' => 'Davis', 'city' => 'Nairobi', 'bio' => 'Graphic designer & art lover. Creativity is my superpower.', 'birth_date' => '1996-09-14', 'gender' => 'female', 'user_role' => 'premium', 'status' => 'active'],
+        ['email' => 'frank@globepair.com', 'password' => password_hash('frank123', PASSWORD_BCRYPT), 'first_name' => 'Frank', 'last_name' => 'Miller', 'city' => 'Nakuru', 'bio' => 'Gym enthusiast & movie buff. Looking for my co-star in life.', 'birth_date' => '1994-02-20', 'gender' => 'male', 'user_role' => 'regular', 'status' => 'active'],
+        ['email' => 'grace@globepair.com', 'password' => password_hash('grace123', PASSWORD_BCRYPT), 'first_name' => 'Grace', 'last_name' => 'Wanjiku', 'city' => 'Nairobi', 'bio' => 'Teacher by day, chef by night. Love trying new recipes.', 'birth_date' => '1997-06-12', 'gender' => 'female', 'user_role' => 'premium', 'status' => 'active'],
+        ['email' => 'henry@globepair.com', 'password' => password_hash('henry123', PASSWORD_BCRYPT), 'first_name' => 'Henry', 'last_name' => 'Ochieng', 'city' => 'Mombasa', 'bio' => 'Marine biologist. The ocean is my second home.', 'birth_date' => '1992-12-05', 'gender' => 'male', 'user_role' => 'regular', 'status' => 'active'],
+    ];
+
+    foreach ($users as $userData) {
+        $user = R::dispense('user');
+        foreach ($userData as $key => $value) {
+            $user->$key = $value;
+        }
+        $user->is_admin = 0;
+        $user->created_at = date('Y-m-d H:i:s');
+        $user->updated_at = date('Y-m-d H:i:s');
+        R::store($user);
+    }
+}
+
+// ==================== HANDLE ACTIONS ====================
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    
+    // LOGIN
+    if (isset($_POST['action']) && $_POST['action'] === 'login') {
+        $email = sanitize($_POST['email'] ?? '');
+        $password = $_POST['password'] ?? '';
+        
+        $user = R::findOne('user', 'email = ?', [$email]);
+        
+        if ($user && password_verify($password, $user->password)) {
+            if ($user->status !== 'active') {
+                $_SESSION['error'] = 'Your account has been deactivated. Please contact support.';
+            } else {
+                $_SESSION['user_id'] = $user->id;
+                $user->last_login = date('Y-m-d H:i:s');
+                R::store($user);
+                $_SESSION['success'] = 'Welcome back, ' . $user->first_name . '!';
+                header('Location: ?action=dashboard');
+                exit;
+            }
+        } else {
+            $_SESSION['error'] = 'Invalid email or password';
+        }
+    }
+    
+    // REGISTER
+    if (isset($_POST['action']) && $_POST['action'] === 'register') {
+        $email = sanitize($_POST['email'] ?? '');
+        $first_name = sanitize($_POST['first_name'] ?? '');
+        $last_name = sanitize($_POST['last_name'] ?? '');
+        $password = $_POST['password'] ?? '';
+        $confirm_password = $_POST['confirm_password'] ?? '';
+        $city = sanitize($_POST['city'] ?? '');
+        $birth_date = $_POST['birth_date'] ?? '';
+        $gender = sanitize($_POST['gender'] ?? '');
+        $bio = sanitize($_POST['bio'] ?? '');
+        
+        $errors = [];
+        
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $errors[] = 'Invalid email address';
+        }
+        if (strlen($password) < 6) {
+            $errors[] = 'Password must be at least 6 characters';
+        }
+        if ($password !== $confirm_password) {
+            $errors[] = 'Passwords do not match';
+        }
+        if (empty($first_name) || empty($last_name)) {
+            $errors[] = 'First and last name are required';
+        }
+        
+        if (empty($errors)) {
+            $existing = R::findOne('user', 'email = ?', [$email]);
+            if ($existing) {
+                $errors[] = 'Email already registered';
+            }
+        }
+        
+        $profile_image = null;
+        if (isset($_FILES['profile_photo']) && $_FILES['profile_photo']['error'] !== UPLOAD_ERR_NO_FILE) {
+            $upload_result = handlePhotoUpload($_FILES['profile_photo']);
+            if (is_array($upload_result) && isset($upload_result['error'])) {
+                $errors[] = $upload_result['error'];
+            } elseif (is_string($upload_result)) {
+                $profile_image = $upload_result;
+            }
+        }
+        
+        if (empty($errors)) {
+            $user = R::dispense('user');
+            $user->email = $email;
+            $user->password = password_hash($password, PASSWORD_BCRYPT);
+            $user->first_name = $first_name;
+            $user->last_name = $last_name;
+            $user->city = $city;
+            $user->birth_date = $birth_date;
+            $user->gender = $gender;
+            $user->bio = $bio;
+            $user->profile_image = $profile_image;
+            $user->user_role = 'regular';
+            $user->is_admin = 0;
+            $user->status = 'active';
+            $user->created_at = date('Y-m-d H:i:s');
+            $user->updated_at = date('Y-m-d H:i:s');
+            
+            $user_id = R::store($user);
+            
+            if ($profile_image) {
+                $old_path = __DIR__ . '/' . $profile_image;
+                $extension = pathinfo($profile_image, PATHINFO_EXTENSION);
+                $new_filename = 'user_' . $user_id . '_' . time() . '.' . $extension;
+                $new_path = UPLOAD_DIR . $new_filename;
+                
+                if (rename($old_path, $new_path)) {
+                    $user->profile_image = 'uploads/' . $new_filename;
+                    R::store($user);
+                }
+            }
+            
+            $_SESSION['success'] = 'Registration successful! Please login.';
+            header('Location: ?action=login');
+            exit;
+        } else {
+            if ($profile_image && file_exists(__DIR__ . '/' . $profile_image)) {
+                unlink(__DIR__ . '/' . $profile_image);
+            }
+            $_SESSION['errors'] = $errors;
+            $_SESSION['form_data'] = [
+                'email' => $email,
+                'first_name' => $first_name,
+                'last_name' => $last_name,
+                'city' => $city,
+                'birth_date' => $birth_date,
+                'gender' => $gender,
+                'bio' => $bio
+            ];
+        }
+    }
+    
+    // UPDATE PROFILE
+    if (isset($_POST['action']) && $_POST['action'] === 'update_profile') {
+        requireLogin();
+        
+        $current_user->first_name = sanitize($_POST['first_name'] ?? '');
+        $current_user->last_name = sanitize($_POST['last_name'] ?? '');
+        $current_user->city = sanitize($_POST['city'] ?? '');
+        $current_user->bio = sanitize($_POST['bio'] ?? '');
+        $current_user->birth_date = $_POST['birth_date'] ?? '';
+        $current_user->gender = sanitize($_POST['gender'] ?? '');
+        $current_user->updated_at = date('Y-m-d H:i:s');
+        
+        R::store($current_user);
+        $_SESSION['success'] = 'Profile updated successfully!';
+        header('Location: ?action=dashboard');
+        exit;
+    }
+    
+    // SEND MESSAGE
+    if (isset($_POST['action']) && $_POST['action'] === 'send_message') {
+        requireLogin();
+        
+        $to_user_id = intval($_POST['to_user_id'] ?? 0);
+        $content = sanitize($_POST['content'] ?? '');
+        
+        $to_user = R::load('user', $to_user_id);
+        
+        if ($to_user_id && !empty($content) && $to_user->id) {
+            // Check if user can send message
+            if (!canSendMessage($current_user, $to_user)) {
+                $_SESSION['error'] = 'Payment required to send messages';
+                $_SESSION['message_redirect'] = $to_user_id;
+                header('Location: ?action=payment_required');
+                exit;
+            }
+            
+            $message = R::dispense('message');
+            $message->from_user_id = $current_user->id;
+            $message->to_user_id = $to_user_id;
+            $message->content = $content;
+            $message->is_read = 0;
+            $message->created_at = date('Y-m-d H:i:s');
+            
+            R::store($message);
+            $_SESSION['success'] = 'Message sent!';
+            header('Location: ?action=chat&user_id=' . $to_user_id);
+            exit;
+        }
+    }
+    
+    // ADD FAVORITE
+    if (isset($_POST['action']) && $_POST['action'] === 'add_favorite') {
+        requireLogin();
+        
+        $favorite_user_id = intval($_POST['favorite_user_id'] ?? 0);
+        
+        if ($favorite_user_id && $favorite_user_id !== $current_user->id) {
+            $existing = R::findOne('favorite', 'user_id = ? AND favorite_user_id = ?', [$current_user->id, $favorite_user_id]);
+            
+            if (!$existing) {
+                $favorite = R::dispense('favorite');
+                $favorite->user_id = $current_user->id;
+                $favorite->favorite_user_id = $favorite_user_id;
+                $favorite->created_at = date('Y-m-d H:i:s');
+                R::store($favorite);
+                $_SESSION['success'] = 'Added to favorites!';
+            }
+        }
+        
+        $redirect = $_POST['redirect'] ?? 'view_profile';
+        if ($redirect === 'home') {
+            header('Location: ?action=home#members');
+        } else {
+            header('Location: ?action=view_profile&id=' . $favorite_user_id);
+        }
+        exit;
+    }
+    
+    // UPGRADE TO PREMIUM
+    if (isset($_POST['action']) && $_POST['action'] === 'upgrade_premium') {
+        requireLogin();
+        
+        $phone = preg_replace('/[^0-9]/', '', $_POST['phone'] ?? '');
+        
+        if (strlen($phone) === 12 && substr($phone, 0, 3) === '254') {
+            $reference = 'PREM_' . $current_user->id . '_' . time();
+            
+            // Initiate STK Push
+            $result = initiateMpesaSTKPush($phone, PREMIUM_PRICE, $reference);
+            
+            if ($result['success']) {
+                // Save pending payment
+                $payment = R::dispense('payment');
+                $payment->user_id = $current_user->id;
+                $payment->phone = $phone;
+                $payment->amount = PREMIUM_PRICE;
+                $payment->status = 'pending';
+                $payment->mpesa_receipt = null;
+                $payment->checkout_request_id = $result['checkout_request_id'];
+                $payment->merchant_request_id = $result['merchant_request_id'];
+                $payment->reference = $reference;
+                $payment->payment_type = 'premium';
+                $payment->created_at = date('Y-m-d H:i:s');
+                R::store($payment);
+                
+                $_SESSION['success'] = 'M-Pesa prompt sent to your phone. Please enter your PIN to complete payment.';
+                header('Location: ?action=payment_status&id=' . $payment->id);
+                exit;
+            } else {
+                $_SESSION['error'] = 'M-Pesa error: ' . $result['error'];
+            }
+        } else {
+            $_SESSION['error'] = 'Invalid phone number format. Use 254712345678';
+        }
+        header('Location: ?action=premium');
+        exit;
+    }
+    
+    // MESSAGE PAYMENT - M-PESA
+    if (isset($_POST['action']) && $_POST['action'] === 'pay_message_mpesa') {
+        requireLogin();
+        
+        $phone = preg_replace('/[^0-9]/', '', $_POST['phone'] ?? '');
+        $to_user_id = intval($_POST['to_user_id'] ?? 0);
+        
+        if (strlen($phone) === 12 && substr($phone, 0, 3) === '254' && $to_user_id) {
+            $reference = 'MSG_' . $current_user->id . '_' . time();
+            
+            $result = initiateMpesaSTKPush($phone, MESSAGE_FEE_KES, $reference);
+            
+            if ($result['success']) {
+                $payment = R::dispense('messagepayment');
+                $payment->user_id = $current_user->id;
+                $payment->phone = $phone;
+                $payment->amount = MESSAGE_FEE_KES;
+                $payment->currency = 'KES';
+                $payment->status = 'pending';
+                $payment->mpesa_receipt = null;
+                $payment->checkout_request_id = $result['checkout_request_id'];
+                $payment->merchant_request_id = $result['merchant_request_id'];
+                $payment->reference = $reference;
+                $payment->to_user_id = $to_user_id;
+                $payment->payment_method = 'mpesa';
+                $payment->expires_at = date('Y-m-d H:i:s', strtotime('+24 hours'));
+                $payment->created_at = date('Y-m-d H:i:s');
+                R::store($payment);
+                
+                $_SESSION['success'] = 'M-Pesa prompt sent! Enter your PIN to complete KES ' . MESSAGE_FEE_KES . ' payment.';
+                header('Location: ?action=payment_status&type=message&id=' . $payment->id);
+                exit;
+            } else {
+                $_SESSION['error'] = 'M-Pesa error: ' . $result['error'];
+            }
+        } else {
+            $_SESSION['error'] = 'Invalid phone number format';
+        }
+        header('Location: ?action=payment_required&user_id=' . $to_user_id);
+        exit;
+    }
+    
+    // MESSAGE PAYMENT - PAYPAL
+    if (isset($_POST['action']) && $_POST['action'] === 'pay_message_paypal') {
+        requireLogin();
+        
+        $to_user_id = intval($_POST['to_user_id'] ?? 0);
+        
+        if ($to_user_id) {
+            $reference = 'MSG_' . $current_user->id . '_' . time();
+            
+            $result = createPayPalOrder(MESSAGE_FEE_USD, $reference);
+            
+            if ($result['success']) {
+                $payment = R::dispense('messagepayment');
+                $payment->user_id = $current_user->id;
+                $payment->amount = MESSAGE_FEE_USD;
+                $payment->currency = 'USD';
+                $payment->status = 'pending';
+                $payment->paypal_order_id = $result['order_id'];
+                $payment->reference = $reference;
+                $payment->to_user_id = $to_user_id;
+                $payment->payment_method = 'paypal';
+                $payment->expires_at = date('Y-m-d H:i:s', strtotime('+24 hours'));
+                $payment->created_at = date('Y-m-d H:i:s');
+                R::store($payment);
+                
+                if ($result['approve_url']) {
+                    header('Location: ' . $result['approve_url']);
+                    exit;
+                }
+            } else {
+                $_SESSION['error'] = 'PayPal error: ' . $result['error'];
+            }
+        }
+        header('Location: ?action=payment_required&user_id=' . $to_user_id);
+        exit;
+    }
+    
+    // ADMIN - TOGGLE USER STATUS
+    if (isset($_POST['action']) && $_POST['action'] === 'toggle_status') {
+        requireAdmin();
+        
+        $user_id = intval($_POST['user_id'] ?? 0);
+        $new_status = sanitize($_POST['new_status'] ?? 'active');
+        
+        if ($user_id) {
+            $user = R::load('user', $user_id);
+            if ($user->id && !$user->is_admin) {
+                $user->status = $new_status;
+                $user->updated_at = date('Y-m-d H:i:s');
+                R::store($user);
+                $_SESSION['success'] = 'User status updated to ' . $new_status;
+            }
+        }
+        header('Location: ?action=admin');
+        exit;
+    }
+}
+
+// Handle PayPal callback
+if ($action === 'paypal_success') {
+    requireLogin();
+    
+    $payment_id = intval($_GET['payment_id'] ?? 0);
+    $token = sanitize($_GET['token'] ?? '');
+    
+    $payment = R::load('messagepayment', $payment_id);
+    
+    if ($payment->id && $payment->status === 'pending' && $payment->payment_method === 'paypal') {
+        $result = capturePayPalOrder($payment->paypal_order_id);
+        
+        if ($result['success']) {
+            $payment->status = 'completed';
+            $payment->paypal_transaction_id = $result['transaction_id'];
+            $payment->completed_at = date('Y-m-d H:i:s');
+            R::store($payment);
+            
+            $_SESSION['success'] = 'Payment successful! You can now send messages.';
+            header('Location: ?action=chat&user_id=' . $payment->to_user_id);
+            exit;
+        } else {
+            $_SESSION['error'] = 'PayPal capture failed: ' . $result['error'];
+        }
+    }
+    header('Location: ?action=dashboard');
+    exit;
+}
+
+if ($action === 'paypal_cancel') {
+    $_SESSION['error'] = 'Payment cancelled';
+    header('Location: ?action=dashboard');
+    exit;
+}
+
+// Logout
+if ($action === 'logout') {
+    session_destroy();
+    header('Location: ?action=home');
+    exit;
+}
+
+// Retrieve form data for repopulating on error
+$form_data = $_SESSION['form_data'] ?? [];
+unset($_SESSION['form_data']);
+
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title><?php echo $page_title; ?></title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    <style>
+        :root {
+            --primary: #667eea;
+            --secondary: #764ba2;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { height: 100%; }
+
+        body {
+            display: flex;
+            flex-direction: column;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f8f9fa;
+        }
+
+        main { flex: 1; }
+
+        .navbar { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1); }
+        .navbar-brand { font-size: 1.5rem; font-weight: 700; letter-spacing: 1px; }
+
+        .hero-section {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+            min-height: 500px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .card {
+            border: none;
+            border-radius: 12px;
+            transition: all 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 12px 24px rgba(0, 0, 0, 0.15) !important;
+        }
+
+        .profile-card .profile-image {
+            height: 300px;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+            overflow: hidden;
+        }
+
+        .profile-card .profile-image img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transition: transform 0.3s ease;
+        }
+
+        .profile-card:hover .profile-image img { transform: scale(1.05); }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+            border: none;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 16px rgba(102, 126, 234, 0.4);
+        }
+
+        .form-control, .form-select {
+            border-radius: 8px;
+            border: 1px solid #ddd;
+        }
+
+        .form-control:focus, .form-select:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 0.2rem rgba(102, 126, 234, 0.25);
+        }
+
+        .chat-container {
+            height: 600px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .messages-area {
+            flex: 1;
+            overflow-y: auto;
+            background: #f8f9fa;
+            padding: 20px;
+        }
+
+        .message { margin-bottom: 15px; display: flex; }
+        .message.sent { justify-content: flex-end; }
+
+        .message-content {
+            max-width: 70%;
+            padding: 10px 15px;
+            border-radius: 8px;
+            word-wrap: break-word;
+        }
+
+        .message.sent .message-content { background: #007bff; color: white; }
+        .message.received .message-content { background: white; border: 1px solid #ddd; }
+
+        footer {
+            margin-top: auto;
+            background-color: #212529;
+            color: white;
+            padding: 2rem 0;
+            border-top: 1px solid #dee2e6;
+        }
+
+        .bg-gradient {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+        }
+
+        .hover-effect {
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .hover-effect:hover {
+            background-color: #f5f5f5 !important;
+            transform: translateX(5px);
+        }
+
+        .photo-upload-container {
+            position: relative;
+            width: 150px;
+            height: 150px;
+            margin: 0 auto;
+            border-radius: 50%;
+            overflow: hidden;
+            border: 4px solid var(--primary);
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .photo-upload-container:hover {
+            transform: scale(1.05);
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4);
+        }
+
+        .photo-upload-container:hover .photo-overlay { opacity: 1; }
+        .photo-upload-container img { width: 100%; height: 100%; object-fit: cover; }
+
+        .photo-placeholder {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            height: 100%;
+            color: white;
+        }
+
+        .photo-placeholder i { font-size: 2.5rem; margin-bottom: 5px; }
+        .photo-placeholder span { font-size: 0.7rem; text-align: center; }
+
+        .photo-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .photo-overlay i { color: white; font-size: 2rem; }
+
+        .photo-upload-container input[type="file"] {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            opacity: 0;
+            cursor: pointer;
+        }
+
+        .file-size-hint { font-size: 0.75rem; color: #6c757d; }
+
+        .payment-option {
+            border: 2px solid #ddd;
+            border-radius: 12px;
+            padding: 20px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .payment-option:hover, .payment-option.active {
+            border-color: var(--primary);
+            background-color: rgba(102, 126, 234, 0.05);
+        }
+
+        .status-active { color: #198754; }
+        .status-inactive { color: #dc3545; }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .card { animation: fadeIn 0.5s ease-out; }
+        .alert { animation: fadeIn 0.3s ease-out; }
+    </style>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark sticky-top">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="?action=home">
+                <i class="bi bi-heart-fill text-danger"></i> GlobePair
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item">
+                        <a class="nav-link" href="?action=home">Home</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="?action=discover">Discover</a>
+                    </li>
+                    
+                    <?php if ($current_user): ?>
+                        <li class="nav-item">
+                            <a class="nav-link" href="?action=dashboard">
+                                <i class="bi bi-house"></i> Dashboard
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="?action=chat">
+                                <i class="bi bi-chat-dots"></i> Messages
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="?action=favorites">
+                                <i class="bi bi-heart"></i> Favorites
+                            </a>
+                        </li>
+                        <?php if (isAdmin()): ?>
+                            <li class="nav-item">
+                                <a class="nav-link text-warning" href="?action=admin">
+                                    <i class="bi bi-shield-lock"></i> Admin
+                                </a>
+                            </li>
+                        <?php endif; ?>
+                        <li class="nav-item dropdown">
+                            <a class="nav-link dropdown-toggle" href="#" id="userMenu" role="button" data-bs-toggle="dropdown">
+                                <i class="bi bi-person-circle"></i> <?php echo $current_user->first_name; ?>
+                            </a>
+                            <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="userMenu">
+                                <li><a class="dropdown-item" href="?action=edit_profile">Edit Profile</a></li>
+                                <?php if ($current_user->user_role === 'regular'): ?>
+                                    <li><a class="dropdown-item" href="?action=premium">
+                                        <i class="bi bi-star-fill text-warning"></i> Go Premium
+                                    </a></li>
+                                <?php endif; ?>
+                                <li><hr class="dropdown-divider"></li>
+                                <li><a class="dropdown-item" href="?action=logout">Logout</a></li>
+                            </ul>
+                        </li>
+                    <?php else: ?>
+                        <li class="nav-item">
+                            <a class="nav-link" href="?action=login">Login</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link btn btn-primary btn-sm text-white ms-2" href="?action=register">Register</a>
+                        </li>
+                    <?php endif; ?>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <main>
+        <?php if (!empty($_SESSION['success'])): ?>
+            <div class="container mt-3">
+                <div class="alert alert-success alert-dismissible fade show" role="alert">
+                    <i class="bi bi-check-circle"></i> <?php echo htmlspecialchars($_SESSION['success']); ?>
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                </div>
+            </div>
+            <?php unset($_SESSION['success']); endif; ?>
+
+        <?php if (!empty($_SESSION['error'])): ?>
+            <div class="container mt-3">
+                <div class="alert alert-danger alert-dismissible fade show" role="alert">
+                    <i class="bi bi-exclamation-circle"></i> <?php echo htmlspecialchars($_SESSION['error']); ?>
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                </div>
+            </div>
+            <?php unset($_SESSION['error']); endif; ?>
+
+        <!-- HOME PAGE -->
+        <?php if ($action === 'home'): $page_title = 'GlobePair - Find Your Perfect Match'; 
+            $home_search = sanitize($_GET['search'] ?? '');
+            $home_gender = sanitize($_GET['gender'] ?? '');
+            $home_city = sanitize($_GET['city'] ?? '');
+            
+            $conditions = ['status = ?', 'is_admin = 0'];
+            $params = ['active', 0];
+            
+            if ($home_gender) {
+                $conditions[] = 'gender = ?';
+                $params[] = $home_gender;
+            }
+            if ($home_city) {
+                $conditions[] = 'city LIKE ?';
+                $params[] = '%' . $home_city . '%';
+            }
+            if ($home_search) {
+                $conditions[] = '(first_name LIKE ? OR last_name LIKE ? OR bio LIKE ?)';
+                $search_param = '%' . $home_search . '%';
+                $params[] = $search_param;
+                $params[] = $search_param;
+                $params[] = $search_param;
+            }
+            
+            $where = implode(' AND ', $conditions);
+            $home_users = R::find('user', $where . ' ORDER BY created_at DESC LIMIT 12', $params);
+        ?>
+            <!-- Hero -->
+            <section class="hero-section text-white">
+                <div class="container text-center py-5">
+                    <h1 class="display-3 fw-bold mb-4">Find Your Perfect Match</h1>
+                    <p class="lead mb-5">Join thousands of singles looking for genuine connections</p>
+                    <div class="d-flex gap-3 justify-content-center flex-wrap">
+                        <?php if (!$current_user): ?>
+                            <a href="?action=register" class="btn btn-light btn-lg px-5">Get Started</a>
+                            <a href="?action=login" class="btn btn-outline-light btn-lg px-5">Login</a>
+                        <?php else: ?>
+                            <a href="?action=discover" class="btn btn-light btn-lg px-5">
+                                <i class="bi bi-search"></i> Discover People
+                            </a>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Features -->
+            <section class="py-5 bg-light">
+                <div class="container">
+                    <h2 class="text-center mb-5 fw-bold">Why Choose GlobePair?</h2>
+                    <div class="row g-4">
+                        <div class="col-md-4">
+                            <div class="card h-100 shadow-sm text-center p-4">
+                                <i class="bi bi-shield-check" style="font-size: 3rem; color: var(--primary);"></i>
+                                <h5 class="card-title mt-3">100% Secure</h5>
+                                <p class="card-text text-muted">End-to-end encrypted messages keep your conversations safe</p>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="card h-100 shadow-sm text-center p-4">
+                                <i class="bi bi-chat-dots" style="font-size: 3rem; color: var(--primary);"></i>
+                                <h5 class="card-title mt-3">Easy Messaging</h5>
+                                <p class="card-text text-muted">Connect with matches instantly and build relationships</p>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="card h-100 shadow-sm text-center p-4">
+                                <i class="bi bi-star-fill" style="font-size: 3rem; color: var(--primary);"></i>
+                                <h5 class="card-title mt-3">Premium Features</h5>
+                                <p class="card-text text-muted">Unlock advanced features with affordable payment options</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Stats -->
+            <section class="py-5">
+                <div class="container">
+                    <div class="row g-4 text-center">
+                        <div class="col-md-3">
+                            <h3 class="text-primary fw-bold">10,000+</h3>
+                            <p class="text-muted">Active Users</p>
+                        </div>
+                        <div class="col-md-3">
+                            <h3 class="text-success fw-bold">2,500+</h3>
+                            <p class="text-muted">Success Stories</p>
+                        </div>
+                        <div class="col-md-3">
+                            <h3 class="text-warning fw-bold">50,000+</h3>
+                            <p class="text-muted">Messages Daily</p>
+                        </div>
+                        <div class="col-md-3">
+                            <h3 class="text-danger fw-bold">24/7</h3>
+                            <p class="text-muted">Support</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- CTA -->
+            <section class="py-5 bg-dark text-white">
+                <div class="container text-center">
+                    <h2 class="mb-4">Ready to Find Love?</h2>
+                    <p class="lead mb-5">Join GlobePair today and start your journey</p>
+                    <?php if (!$current_user): ?>
+                        <a href="?action=register" class="btn btn-light btn-lg px-5">Sign Up Now</a>
+                    <?php else: ?>
+                        <a href="?action=discover" class="btn btn-light btn-lg px-5">Start Exploring</a>
+                    <?php endif; ?>
+                </div>
+            </section>
+
+            <!-- MEMBERS LISTING -->
+            <section class="py-5 bg-light" id="members">
+                <div class="container">
+                    <h2 class="text-center mb-4 fw-bold">Browse Our Members</h2>
+                    <p class="text-center text-muted mb-5">Find someone who catches your eye</p>
+
+                    <!-- Search Form -->
+                    <div class="card border-0 shadow-sm mb-5">
+                        <div class="card-body p-4">
+                            <form method="GET" class="row g-3" id="homeSearchForm">
+                                <div class="col-md-4">
+                                    <label class="form-label">Search</label>
+                                    <input type="text" class="form-control" name="search" value="<?php echo htmlspecialchars($home_search); ?>" placeholder="Search by name...">
+                                </div>
+                                <div class="col-md-3">
+                                    <label class="form-label">Gender</label>
+                                    <select class="form-select" name="gender">
+                                        <option value="">All</option>
+                                        <option value="male" <?php echo $home_gender === 'male' ? 'selected' : ''; ?>>Male</option>
+                                        <option value="female" <?php echo $home_gender === 'female' ? 'selected' : ''; ?>>Female</option>
+                                    </select>
+                                </div>
+                                <div class="col-md-3">
+                                    <label class="form-label">City</label>
+                                    <input type="text" class="form-control" name="city" value="<?php echo htmlspecialchars($home_city); ?>" placeholder="Search by city...">
+                                </div>
+                                <div class="col-md-2 d-flex align-items-end">
+                                    <button type="submit" class="btn btn-primary w-100">
+                                        <i class="bi bi-search"></i> Search
+                                    </button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+
+                    <?php if (empty($home_users)): ?>
+                        <div class="alert alert-info text-center py-5">
+                            <i class="bi bi-inbox" style="font-size: 3rem;"></i>
+                            <p class="mt-3">No members found. Try adjusting your search!</p>
+                        </div>
+                    <?php else: ?>
+                        <div class="row g-4">
+                            <?php foreach ($home_users as $profile): ?>
+                                <div class="col-md-6 col-lg-4 col-xl-3">
+                                    <div class="card h-100 shadow-sm border-0 profile-card overflow-hidden">
+                                        <div class="profile-image position-relative">
+                                            <?php if ($profile->profile_image): ?>
+                                                <img src="<?php echo htmlspecialchars($profile->profile_image); ?>" alt="<?php echo htmlspecialchars($profile->first_name); ?>">
+                                            <?php else: ?>
+                                                <div class="w-100 h-100 d-flex align-items-center justify-content-center text-white">
+                                                    <i class="bi bi-person-circle" style="font-size: 5rem;"></i>
+                                                </div>
+                                            <?php endif; ?>
+                                            <?php if ($profile->user_role === 'premium'): ?>
+                                                <span class="badge bg-warning position-absolute top-2 end-2">
+                                                    <i class="bi bi-star-fill"></i> Premium
+                                                </span>
+                                            <?php endif; ?>
+                                        </div>
+                                        <div class="card-body p-3">
+                                            <h5 class="card-title mb-1"><?php echo htmlspecialchars($profile->first_name . ' ' . $profile->last_name); ?></h5>
+                                            <p class="text-muted small mb-2">
+                                                <i class="bi bi-geo-alt"></i> <?php echo htmlspecialchars($profile->city); ?>
+                                            </p>
+                                            <p class="card-text small text-muted" style="max-height: 60px; overflow: hidden;">
+                                                <?php echo htmlspecialchars(substr($profile->bio, 0, 80)) . '...'; ?>
+                                            </p>
+                                        </div>
+                                        <div class="card-footer bg-light border-top p-2">
+                                            <div class="d-grid gap-2 d-md-flex">
+                                                <a href="?action=view_profile&id=<?php echo $profile->id; ?>" class="btn btn-sm btn-outline-primary flex-fill">
+                                                    <i class="bi bi-eye"></i> View
+                                                </a>
+                                                <a href="?action=chat_redirect&user_id=<?php echo $profile->id; ?>" class="btn btn-sm btn-primary flex-fill">
+                                                    <i class="bi bi-chat-dots"></i> Chat
+                                                </a>
+                                                <?php if ($current_user): ?>
+                                                    <form method="POST" style="display: inline; flex: 0;">
+                                                        <input type="hidden" name="action" value="add_favorite">
+                                                        <input type="hidden" name="favorite_user_id" value="<?php echo $profile->id; ?>">
+                                                        <input type="hidden" name="redirect" value="home">
+                                                        <button type="submit" class="btn btn-sm btn-outline-danger">
+                                                            <i class="bi bi-heart"></i>
+                                                        </button>
+                                                    </form>
+                                                <?php endif; ?>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </section>
+
+        <!-- CHAT REDIRECT (for non-logged in users) -->
+        <?php elseif ($action === 'chat_redirect'):
+            $redirect_user_id = intval($_GET['user_id'] ?? 0);
+            if (!$current_user) {
+                $_SESSION['chat_redirect'] = $redirect_user_id;
+                header('Location: ?action=register');
+                exit;
+            } else {
+                header('Location: ?action=chat&user_id=' . $redirect_user_id);
+                exit;
+            }
+        ?>
+
+        <!-- LOGIN PAGE -->
+        <?php elseif ($action === 'login'): $page_title = 'Login - GlobePair'; ?>
+            <div class="container py-5">
+                <div class="row justify-content-center">
+                    <div class="col-lg-5">
+                        <div class="card shadow-lg border-0">
+                            <div class="card-body p-5">
+                                <div class="text-center mb-4">
+                                    <h2 class="fw-bold">Welcome Back</h2>
+                                    <p class="text-muted">Login to your GlobePair account</p>
+                                </div>
+
+                                <form method="POST">
+                                    <input type="hidden" name="action" value="login">
+                                    
+                                    <div class="mb-3">
+                                        <label class="form-label">Email Address</label>
+                                        <input type="email" class="form-control" name="email" required>
+                                    </div>
+
+                                    <div class="mb-4">
+                                        <label class="form-label">Password</label>
+                                        <input type="password" class="form-control" name="password" required>
+                                    </div>
+
+                                    <button type="submit" class="btn btn-primary w-100 btn-lg fw-bold mb-3">
+                                        <i class="bi bi-lock"></i> Login
+                                    </button>
+
+                                    <p class="text-center text-muted">
+                                        Don't have an account? 
+                                        <a href="?action=register" class="text-decoration-none fw-bold">Register here</a>
+                                    </p>
+                                </form>
+                            </div>
+                        </div>
+
+                        <div class="card mt-4 bg-info bg-opacity-10 border-info">
+                            <div class="card-body">
+                                <small class="text-muted">
+                                    <strong>📝 Demo Credentials:</strong><br>
+                                    User: alice@globepair.com / alice123<br>
+                                    Admin: admin@globepair.com / admin123
+                                </small>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        <!-- REGISTER PAGE -->
+        <?php elseif ($action === 'register'): $page_title = 'Register - GlobePair'; ?>
+            <div class="container py-5">
+                <div class="row justify-content-center">
+                    <div class="col-lg-6">
+                        <div class="card shadow-lg border-0">
+                            <div class="card-body p-5">
+                                <div class="text-center mb-4">
+                                    <h2 class="fw-bold">Create Account</h2>
+                                    <p class="text-muted">Join GlobePair today</p>
+                                </div>
+
+                                <?php if (!empty($_SESSION['errors'])): ?>
+                                    <div class="alert alert-danger">
+                                        <?php foreach ($_SESSION['errors'] as $error): ?>
+                                            <div><i class="bi bi-exclamation-circle"></i> <?php echo htmlspecialchars($error); ?></div>
+                                        <?php endforeach; ?>
+                                    </div>
+                                    <?php unset($_SESSION['errors']); endif; ?>
+
+                                <?php if (!empty($_SESSION['chat_redirect'])): ?>
+                                    <div class="alert alert-info">
+                                        <i class="bi bi-info-circle"></i> Register to start chatting with members!
+                                    </div>
+                                <?php endif; ?>
+
+                                <form method="POST" enctype="multipart/form-data">
+                                    <input type="hidden" name="action" value="register">
+                                    
+                                    <div class="text-center mb-4">
+                                        <div class="photo-upload-container" id="photoUploadContainer">
+                                            <div class="photo-placeholder" id="photoPlaceholder">
+                                                <i class="bi bi-camera"></i>
+                                                <span>Add Photo</span>
+                                            </div>
+                                            <img id="photoPreview" src="" alt="" style="display: none;">
+                                            <div class="photo-overlay">
+                                                <i class="bi bi-pencil"></i>
+                                            </div>
+                                            <input type="file" name="profile_photo" id="profilePhotoInput" accept="image/jpeg,image/png,image/gif,image/webp">
+                                        </div>
+                                        <div class="mt-2">
+                                            <small class="file-size-hint">
+                                                <i class="bi bi-info-circle"></i> JPG, PNG, GIF or WebP (Max 5MB)
+                                            </small>
+                                        </div>
+                                        <div id="fileName" class="mt-1" style="display: none;">
+                                            <small class="text-success"><i class="bi bi-check-circle"></i> <span id="fileNameText"></span></small>
+                                            <button type="button" class="btn btn-link text-danger p-0 ms-1" id="removePhoto" style="font-size: 0.75rem; text-decoration: none;">
+                                                <i class="bi bi-x-circle"></i> Remove
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div class="row">
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">First Name *</label>
+                                            <input type="text" class="form-control" name="first_name" value="<?php echo htmlspecialchars($form_data['first_name'] ?? ''); ?>" required>
+                                        </div>
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">Last Name *</label>
+                                            <input type="text" class="form-control" name="last_name" value="<?php echo htmlspecialchars($form_data['last_name'] ?? ''); ?>" required>
+                                        </div>
+                                    </div>
+
+                                    <div class="mb-3">
+                                        <label class="form-label">Email Address *</label>
+                                        <input type="email" class="form-control" name="email" value="<?php echo htmlspecialchars($form_data['email'] ?? ''); ?>" required>
+                                    </div>
+
+                                    <div class="row">
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">City *</label>
+                                            <input type="text" class="form-control" name="city" value="<?php echo htmlspecialchars($form_data['city'] ?? ''); ?>" required>
+                                        </div>
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">Date of Birth *</label>
+                                            <input type="date" class="form-control" name="birth_date" value="<?php echo htmlspecialchars($form_data['birth_date'] ?? ''); ?>" required>
+                                        </div>
+                                    </div>
+
+                                    <div class="row">
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">Gender *</label>
+                                            <select class="form-select" name="gender" required>
+                                                <option value="">Select...</option>
+                                                <option value="male" <?php echo ($form_data['gender'] ?? '') === 'male' ? 'selected' : ''; ?>>Male</option>
+                                                <option value="female" <?php echo ($form_data['gender'] ?? '') === 'female' ? 'selected' : ''; ?>>Female</option>
+                                                <option value="other" <?php echo ($form_data['gender'] ?? '') === 'other' ? 'selected' : ''; ?>>Other</option>
+                                            </select>
+                                        </div>
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">Password *</label>
+                                            <input type="password" class="form-control" name="password" required>
+                                        </div>
+                                    </div>
+
+                                    <div class="mb-3">
+                                        <label class="form-label">Confirm Password *</label>
+                                        <input type="password" class="form-control" name="confirm_password" required>
+                                    </div>
+
+                                    <div class="mb-3">
+                                        <label class="form-label">Bio</label>
+                                        <textarea class="form-control" name="bio" rows="3" placeholder="Tell us about yourself..."><?php echo htmlspecialchars($form_data['bio'] ?? ''); ?></textarea>
+                                    </div>
+
+                                    <button type="submit" class="btn btn-primary w-100 btn-lg fw-bold mb-3">
+                                        <i class="bi bi-person-plus"></i> Create Account
+                                    </button>
+
+                                    <p class="text-center text-muted">
+                                        Already have an account? 
+                                        <a href="?action=login" class="text-decoration-none fw-bold">Login here</a>
+                                    </p>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        <!-- PAYMENT REQUIRED PAGE -->
+        <?php elseif ($action === 'payment_required'): $page_title = 'Payment Required - GlobePair'; requireLogin();
+            $payment_user_id = intval($_GET['user_id'] ?? ($_SESSION['message_redirect'] ?? 0));
+            unset($_SESSION['message_redirect']);
+            $payment_target_user = R::load('user', $payment_user_id);
+            
+            // Check if already can send
+            if ($payment_target_user->id && canSendMessage($current_user, $payment_target_user)) {
+                header('Location: ?action=chat&user_id=' . $payment_user_id);
+                exit;
+            }
+        ?>
+            <div class="container py-5">
+                <div class="row justify-content-center">
+                    <div class="col-lg-8">
+                        <div class="card shadow-lg border-0">
+                            <div class="card-header bg-warning text-white">
+                                <h3 class="mb-0 fw-bold">
+                                    <i class="bi bi-lock"></i> Payment Required to Message
+                                </h3>
+                            </div>
+                            <div class="card-body p-5">
+                                <?php if ($current_user->user_role === 'premium'): ?>
+                                    <div class="alert alert-info mb-4">
+                                        <i class="bi bi-info-circle"></i> 
+                                        You are a premium member, but the recipient is not. They need to be premium for free messaging, or you can pay a small fee.
+                                    </div>
+                                <?php else: ?>
+                                    <div class="alert alert-warning mb-4">
+                                        <i class="bi bi-star"></i> 
+                                        <strong>Tip:</strong> Upgrade to <a href="?action=premium" class="fw-bold">Premium</a> for unlimited messaging with other premium members!
+                                    </div>
+                                <?php endif; ?>
+
+                                <?php if ($payment_target_user->id): ?>
+                                    <div class="text-center mb-4">
+                                        <p class="text-muted">You want to message:</p>
+                                        <h4><?php echo htmlspecialchars($payment_target_user->first_name . ' ' . $payment_target_user->last_name); ?></h4>
+                                        <p class="text-muted small"><i class="bi bi-geo-alt"></i> <?php echo htmlspecialchars($payment_target_user->city); ?></p>
+                                    </div>
+                                <?php endif; ?>
+
+                                <div class="row g-4">
+                                    <!-- M-PESA Option -->
+                                    <div class="col-md-6">
+                                        <div class="payment-option h-100">
+                                            <div class="text-center mb-3">
+                                                <i class="bi bi-phone" style="font-size: 3rem; color: #4CAF50;"></i>
+                                                <h5 class="mt-2">M-Pesa</h5>
+                                            </div>
+                                            <div class="text-center mb-3">
+                                                <span class="display-5 fw-bold text-success">KES <?php echo number_format(MESSAGE_FEE_KES); ?></span>
+                                            </div>
+                                            <form method="POST">
+                                                <input type="hidden" name="action" value="pay_message_mpesa">
+                                                <input type="hidden" name="to_user_id" value="<?php echo $payment_user_id; ?>">
+                                                
+                                                <div class="mb-3">
+                                                    <label class="form-label">M-Pesa Phone Number</label>
+                                                    <div class="input-group">
+                                                        <span class="input-group-text">+</span>
+                                                        <input type="tel" class="form-control" name="phone" placeholder="254712345678" pattern="254[0-9]{9}" required>
+                                                    </div>
+                                                </div>
+                                                
+                                                <button type="submit" class="btn btn-success w-100 fw-bold">
+                                                    <i class="bi bi-check-circle"></i> Pay with M-Pesa
+                                                </button>
+                                            </form>
+                                        </div>
+                                    </div>
+
+                                    <!-- PayPal Option -->
+                                    <div class="col-md-6">
+                                        <div class="payment-option h-100">
+                                            <div class="text-center mb-3">
+                                                <i class="bi bi-paypal" style="font-size: 3rem; color: #003087;"></i>
+                                                <h5 class="mt-2">PayPal / Credit Card</h5>
+                                            </div>
+                                            <div class="text-center mb-3">
+                                                <span class="display-5 fw-bold" style="color: #003087;">$<?php echo number_format(MESSAGE_FEE_USD, 2); ?></span>
+                                            </div>
+                                            <form method="POST">
+                                                <input type="hidden" name="action" value="pay_message_paypal">
+                                                <input type="hidden" name="to_user_id" value="<?php echo $payment_user_id; ?>">
+                                                
+                                                <div class="alert alert-info small">
+                                                    <i class="bi bi-info-circle"></i> You'll be redirected to PayPal to complete payment securely. Accepts PayPal balance, credit/debit cards.
+                                                </div>
+                                                
+                                                <button type="submit" class="btn btn-primary w-100 fw-bold" style="background-color: #003087;">
+                                                    <i class="bi bi-paypal"></i> Pay with PayPal
+                                                </button>
+                                            </form>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="text-center mt-4">
+                                    <a href="?action=discover" class="btn btn-outline-secondary">
+                                        <i class="bi bi-arrow-left"></i> Back to Browse
+                                    </a>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        <!-- PAYMENT STATUS PAGE -->
+        <?php elseif ($action === 'payment_status'): requireLogin();
+            $status_payment_id = intval($_GET['id'] ?? 0);
+            $status_type = sanitize($_GET['type'] ?? 'premium');
+            
+            if ($status_type === 'message') {
+                $status_payment = R::load('messagepayment', $status_payment_id);
+            } else {
+                $status_payment = R::load('payment', $status_payment_id);
+            }
+            
+            $page_title = 'Payment Status - GlobePair';
+        ?>
+            <div class="container py-5">
+                <div class="row justify-content-center">
+                    <div class="col-lg-6">
+                        <div class="card shadow-lg border-0">
+                            <div class="card-body p-5 text-center">
+                                <div class="mb-4">
+                                    <div class="spinner-border text-primary" role="status" id="paymentSpinner">
+                                        <span class="visually-hidden">Loading...</span>
+                                    </div>
+                                </div>
+                                
+                                <h4 class="mb-3">Processing Payment...</h4>
+                                <p class="text-muted">Please check your phone and enter your M-Pesa PIN to complete the transaction.</p>
+                                
+                                <div class="alert alert-info">
+                                    <i class="bi bi-clock"></i> This page will update automatically. You can also check back later from your dashboard.
+                                </div>
+                                
+                                <div class="mt-4">
+                                    <a href="?action=dashboard" class="btn btn-outline-primary">
+                                        <i class="bi bi-house"></i> Go to Dashboard
+                                    </a>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        <!-- DASHBOARD -->
+        <?php elseif ($action === 'dashboard'): $page_title = 'Dashboard - GlobePair'; requireLogin(); 
+            $message_count = R::count('message', 'to_user_id = ? AND is_read = 0', [$current_user->id]);
+            $favorite_count = R::count('favorite', 'user_id = ?', [$current_user->id]);
+            $received_favorites = R::count('favorite', 'favorite_user_id = ?', [$current_user->id]);
+            
+            // Check for pending message payments
+            $pending_payments = R::find('messagepayment', 'user_id = ? AND status = ?', [$current_user->id, 'pending']);
+        ?>
+            <div class="container-fluid py-4">
+                <div class="container">
+                    <h1 class="mb-4">Welcome back, <?php echo htmlspecialchars($current_user->first_name); ?>! 👋</h1>
+
+                    <?php if ($pending_payments && count($pending_payments) > 0): ?>
+                        <div class="alert alert-warning">
+                            <i class="bi bi-clock"></i> You have <?php echo count($pending_payments); ?> pending payment(s). 
+                            <a href="?action=my_payments" class="fw-bold">View Payments</a>
+                        </div>
+                    <?php endif; ?>
+
+                    <div class="row g-4 mb-5">
+                        <div class="col-md-3">
+                            <div class="card border-0 shadow-sm bg-primary text-white">
+                                <div class="card-body">
+                                    <h6 class="card-title mb-0">Unread Messages</h6>
+                                    <h2 class="fw-bold mt-2"><?php echo $message_count; ?></h2>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="card border-0 shadow-sm bg-success text-white">
+                                <div class="card-body">
+                                    <h6 class="card-title mb-0">Your Favorites</h6>
+                                    <h2 class="fw-bold mt-2"><?php echo $favorite_count; ?></h2>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="card border-0 shadow-sm bg-warning text-white">
+                                <div class="card-body">
+                                    <h6 class="card-title mb-0">Who Liked You</h6>
+                                    <h2 class="fw-bold mt-2"><?php echo $received_favorites; ?></h2>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="card border-0 shadow-sm <?php echo $current_user->user_role === 'premium' ? 'bg-info' : 'bg-secondary'; ?> text-white">
+                                <div class="card-body">
+                                    <h6 class="card-title mb-0">Status</h6>
+                                    <h2 class="fw-bold mt-2"><?php echo ucfirst($current_user->user_role); ?></h2>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="row g-4 mb-5">
+                        <div class="col-md-4">
+                            <div class="card border-0 shadow-sm">
+                                <div class="card-body text-center p-4">
+                                    <i class="bi bi-search" style="font-size: 2.5rem; color: var(--primary);"></i>
+                                    <h5 class="card-title mt-2">Discover People</h5>
+                                    <a href="?action=discover" class="btn btn-primary btn-sm">Start Exploring</a>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="card border-0 shadow-sm">
+                                <div class="card-body text-center p-4">
+                                    <i class="bi bi-chat-dots" style="font-size: 2.5rem; color: var(--primary);"></i>
+                                    <h5 class="card-title mt-2">Your Messages</h5>
+                                    <a href="?action=chat" class="btn btn-primary btn-sm">Go to Messages <?php if ($message_count): ?><span class="badge bg-danger ms-1"><?php echo $message_count; ?></span><?php endif; ?></a>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="card border-0 shadow-sm">
+                                <div class="card-body text-center p-4">
+                                    <i class="bi bi-receipt" style="font-size: 2.5rem; color: var(--primary);"></i>
+                                    <h5 class="card-title mt-2">My Payments</h5>
+                                    <a href="?action=my_payments" class="btn btn-primary btn-sm">View History</a>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        <!-- DISCOVER PROFILES - FIXED SECTION -->
+        <?php elseif ($action === 'discover'): $page_title = 'Discover - GlobePair'; 
+            $search = sanitize($_GET['search'] ?? '');
+            $gender = sanitize($_GET['gender'] ?? '');
+            $city = sanitize($_GET['city'] ?? '');
+            $page = max(1, intval($_GET['page'] ?? 1));
+            $per_page = 12;
+
+            $conditions = [];
+            $params = [];
+            
+            // Build conditions properly
+            $conditions[] = 'status = ?';
+            $params[] = 'active';
+            $conditions[] = 'is_admin = ?';
+            $params[] = 0;
+            
+            if ($current_user) {
+                $conditions[] = 'id != ?';
+                $params[] = $current_user->id;
+            }
+
+            if ($gender) { 
+                $conditions[] = 'gender = ?'; 
+                $params[] = $gender; 
+            }
+            if ($city) { 
+                $conditions[] = 'city LIKE ?'; 
+                $params[] = '%' . $city . '%'; 
+            }
+            if ($search) {
+                $conditions[] = '(first_name LIKE ? OR last_name LIKE ? OR bio LIKE ?)';
+                $search_param = '%' . $search . '%';
+                $params[] = $search_param;
+                $params[] = $search_param;
+                $params[] = $search_param;
+            }
+
+            $where = ' ' . implode(' AND ', $conditions);
+            
+            // Fix: Build params for LIMIT separately
+            $limit_params = $params;
+            $limit_params[] = $per_page;
+            $limit_params[] = ($page - 1) * $per_page;
+            
+            $users = R::find('user', $where . ' ORDER BY created_at DESC LIMIT ? OFFSET ?', $limit_params);
+            $total = R::count('user', $where, $params);
+            $total_pages = ceil($total / $per_page);
+        ?>
+            <div class="container-fluid py-4">
+                <div class="container">
+                    <h1 class="mb-4">Discover People</h1>
+
+                    <div class="card border-0 shadow-sm mb-5">
+                        <div class="card-body p-4">
+                            <form method="GET" class="row g-3">
+                                <input type="hidden" name="action" value="discover">
+                                <div class="col-md-4">
+                                    <label class="form-label">Search</label>
+                                    <input type="text" class="form-control" name="search" value="<?php echo htmlspecialchars($search); ?>" placeholder="Search by name...">
+                                </div>
+                                <div class="col-md-3">
+                                    <label class="form-label">Gender</label>
+                                    <select class="form-select" name="gender">
+                                        <option value="">All</option>
+                                        <option value="male" <?php echo $gender === 'male' ? 'selected' : ''; ?>>Male</option>
+                                        <option value="female" <?php echo $gender === 'female' ? 'selected' : ''; ?>>Female</option>
+                                    </select>
+                                </div>
+                                <div class="col-md-3">
+                                    <label class="form-label">City</label>
+                                    <input type="text" class="form-control" name="city" value="<?php echo htmlspecialchars($city); ?>" placeholder="Search by city...">
+                                </div>
+                                <div class="col-md-2 d-flex align-items-end">
+                                    <button type="submit" class="btn btn-primary w-100"><i class="bi bi-search"></i> Search</button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+
+                    <?php if (empty($users)): ?>
+                        <div class="alert alert-info text-center py-5">
+                            <i class="bi bi-inbox" style="font-size: 3rem;"></i>
+                            <p class="mt-3">No profiles found. Try adjusting your filters!</p>
+                        </div>
+                    <?php else: ?>
+                        <div class="row g-4 mb-5">
+                            <?php foreach ($users as $profile): ?>
+                                <div class="col-md-6 col-lg-4 col-xl-3">
+                                    <div class="card h-100 shadow-sm border-0 profile-card overflow-hidden">
+                                        <div class="profile-image position-relative">
+                                            <?php if ($profile->profile_image): ?>
+                                                <img src="<?php echo htmlspecialchars($profile->profile_image); ?>" alt="Profile">
+                                            <?php else: ?>
+                                                <div class="w-100 h-100 d-flex align-items-center justify-content-center text-white">
+                                                    <i class="bi bi-person-circle" style="font-size: 5rem;"></i>
+                                                </div>
+                                            <?php endif; ?>
+                                            <?php if ($profile->user_role === 'premium'): ?>
+                                                <span class="badge bg-warning position-absolute top-2 end-2"><i class="bi bi-star-fill"></i></span>
+                                            <?php endif; ?>
+                                        </div>
+                                        <div class="card-body p-3">
+                                            <h5 class="card-title mb-1"><?php echo htmlspecialchars($profile->first_name . ' ' . $profile->last_name); ?></h5>
+                                            <p class="text-muted small mb-2"><i class="bi bi-geo-alt"></i> <?php echo htmlspecialchars($profile->city); ?></p>
+                                            <p class="card-text small text-muted" style="max-height: 60px; overflow: hidden;">
+                                                <?php echo htmlspecialchars(substr($profile->bio, 0, 80)) . '...'; ?>
+                                            </p>
+                                        </div>
+                                        <div class="card-footer bg-light border-top p-2">
+                                            <div class="d-grid gap-2 d-md-flex">
+                                                <a href="?action=view_profile&id=<?php echo $profile->id; ?>" class="btn btn-sm btn-outline-primary flex-fill"><i class="bi bi-eye"></i> View</a>
+                                                <?php if ($current_user): ?>
+                                                    <form method="POST" style="display: inline; flex: 1;">
+                                                        <input type="hidden" name="action" value="add_favorite">
+                                                        <input type="hidden" name="favorite_user_id" value="<?php echo $profile->id; ?>">
+                                                        <button type="submit" class="btn btn-sm btn-outline-danger w-100"><i class="bi bi-heart"></i></button>
+                                                    </form>
+                                                <?php endif; ?>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+
+                        <?php if ($total_pages > 1): ?>
+                            <nav aria-label="Page navigation" class="mb-5">
+                                <ul class="pagination justify-content-center">
+                                    <?php for ($i = 1; $i <= $total_pages; $i++): ?>
+                                        <li class="page-item <?php echo $i === $page ? 'active' : ''; ?>">
+                                            <a class="page-link" href="?action=discover&page=<?php echo $i; ?>&search=<?php echo urlencode($search); ?>&gender=<?php echo urlencode($gender); ?>&city=<?php echo urlencode($city); ?>"><?php echo $i; ?></a>
+                                        </li>
+                                    <?php endfor; ?>
+                                </ul>
+                            </nav>
+                        <?php endif; ?>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+        <!-- VIEW PROFILE -->
+        <?php elseif ($action === 'view_profile'): 
+            $user_id = intval($_GET['id'] ?? 0);
+            if (!$user_id) header('Location: ?action=discover');
+            
+            $profile = R::load('user', $user_id);
+            if (!$profile || !$profile->id || $profile->is_admin) header('Location: ?action=discover');
+            
+            $page_title = htmlspecialchars($profile->first_name . ' ' . $profile->last_name) . ' - GlobePair';
+            
+            $is_favorite = false;
+            if ($current_user) {
+                $favorite = R::findOne('favorite', 'user_id = ? AND favorite_user_id = ?', [$current_user->id, $user_id]);
+                $is_favorite = (bool) $favorite;
+            }
+            
+            $can_chat = $current_user && canSendMessage($current_user, $profile);
+        ?>
+            <div class="container-fluid py-4">
+                <div class="container">
+                    <a href="?action=discover" class="btn btn-secondary mb-4"><i class="bi bi-arrow-left"></i> Back</a>
+
+                    <div class="row g-4">
+                        <div class="col-md-6 col-lg-4">
+                            <div class="card border-0 shadow-lg overflow-hidden position-relative" style="height: 600px;">
+                                <?php if ($profile->profile_image): ?>
+                                    <img src="<?php echo htmlspecialchars($profile->profile_image); ?>" class="w-100 h-100" style="object-fit: cover;">
+                                <?php else: ?>
+                                    <div class="w-100 h-100 d-flex align-items-center justify-content-center bg-gradient text-white">
+                                        <i class="bi bi-person-circle" style="font-size: 8rem;"></i>
+                                    </div>
+                                <?php endif; ?>
+                                
+                                <?php if ($profile->user_role === 'premium'): ?>
+                                    <div class="position-absolute top-0 end-0 p-3">
+                                        <span class="badge bg-warning"><i class="bi bi-star-fill"></i> Premium</span>
+                                    </div>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+
+                        <div class="col-md-6 col-lg-8">
+                            <div class="card border-0 shadow-lg">
+                                <div class="card-body p-5">
+                                    <h1 class="display-5 fw-bold mb-2">
+                                        <?php echo htmlspecialchars($profile->first_name . ' ' . $profile->last_name); ?>
+                                    </h1>
+                                    
+                                    <div class="mb-4">
+                                        <p class="text-muted mb-1"><i class="bi bi-geo-alt"></i> <?php echo htmlspecialchars($profile->city); ?></p>
+                                        <p class="text-muted mb-1"><i class="bi bi-venus-mars"></i> <?php echo ucfirst($profile->gender); ?></p>
+                                        <p class="text-muted mb-0">
+                                            <i class="bi bi-calendar"></i> 
+                                            <?php echo date_diff(date_create($profile->birth_date), date_create('today'))->y . ' years old'; ?>
+                                        </p>
+                                    </div>
+
+                                    <hr>
+
+                                    <h4 class="mb-3">About Me</h4>
+                                    <p class="text-muted fs-5 mb-4"><?php echo nl2br(htmlspecialchars($profile->bio)); ?></p>
+
+                                    <?php if ($current_user && $current_user->id !== $user_id): ?>
+                                        <div class="d-grid gap-2 d-md-flex">
+                                            <?php if ($can_chat): ?>
+                                                <a href="?action=chat&user_id=<?php echo $user_id; ?>" class="btn btn-primary btn-lg">
+                                                    <i class="bi bi-chat-dots"></i> Send Message
+                                                </a>
+                                            <?php else: ?>
+                                                <a href="?action=payment_required&user_id=<?php echo $user_id; ?>" class="btn btn-warning btn-lg">
+                                                    <i class="bi bi-lock"></i> Pay to Message
+                                                </a>
+                                            <?php endif; ?>
+                                            <form method="POST" style="flex: 1;">
+                                                <input type="hidden" name="action" value="add_favorite">
+                                                <input type="hidden" name="favorite_user_id" value="<?php echo $user_id; ?>">
+                                                <button type="submit" class="btn <?php echo $is_favorite ? 'btn-danger' : 'btn-outline-danger'; ?> btn-lg w-100">
+                                                    <i class="bi <?php echo $is_favorite ? 'bi-heart-fill' : 'bi-heart'; ?>"></i> 
+                                                    <?php echo $is_favorite ? 'Liked' : 'Like'; ?>
+                                                </button>
+                                            </form>
+                                        </div>
+                                    <?php elseif (!$current_user): ?>
+                                        <div class="alert alert-info">
+                                            <a href="?action=chat_redirect&user_id=<?php echo $user_id; ?>" class="btn btn-primary">
+                                                <i class="bi bi-chat-dots"></i> Register to Chat
+                                            </a>
+                                        </div>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        <!-- CHAT -->
+        <?php elseif ($action === 'chat'): $page_title = 'Messages - GlobePair'; requireLogin();
+            $other_user_id = intval($_GET['user_id'] ?? 0);
+            
+            // Check if can send message
+            if ($other_user_id) {
+                $other_user_check = R::load('user', $other_user_id);
+                if ($other_user_check->id && !canSendMessage($current_user, $other_user_check)) {
+                    header('Location: ?action=payment_required&user_id=' . $other_user_id);
+                    exit;
+                }
+            }
+        ?>
+            <div class="container-fluid py-4">
+                <div class="container">
+                    <h1 class="mb-4">Messages</h1>
+
+                    <div class="row g-4" style="min-height: 600px;">
+                        <div class="col-md-4">
+                            <div class="card border-0 shadow-sm">
+                                <div class="card-header border-bottom">
+                                    <h5 class="card-title mb-0">Conversations</h5>
+                                </div>
+                                <div class="card-body p-0" style="max-height: 600px; overflow-y: auto;">
+                                    <?php 
+                                    $users_set = R::find('message', 'from_user_id = ? OR to_user_id = ? GROUP BY CASE WHEN from_user_id = ? THEN to_user_id ELSE from_user_id END ORDER BY created_at DESC',
+                                        [$current_user->id, $current_user->id, $current_user->id]);
+                                    
+                                    if (empty($users_set)): 
+                                    ?>
+                                        <div class="p-3 text-center text-muted">
+                                            <p>No conversations yet</p>
+                                            <a href="?action=discover" class="btn btn-sm btn-primary">Start Messaging</a>
+                                        </div>
+                                    <?php else: 
+                                        foreach ($users_set as $msg): 
+                                            $other_id = $msg->from_user_id === $current_user->id ? $msg->to_user_id : $msg->from_user_id;
+                                            $other = R::load('user', $other_id);
+                                            if ($other->id && !$other->is_admin):
+                                    ?>
+                                        <a href="?action=chat&user_id=<?php echo $other_id; ?>" class="list-group-item list-group-item-action text-decoration-none border-0 border-bottom">
+                                            <div class="d-flex justify-content-between align-items-start">
+                                                <div>
+                                                    <h6 class="mb-1"><?php echo htmlspecialchars($other->first_name . ' ' . $other->last_name); ?></h6>
+                                                    <p class="text-muted small mb-0" style="max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                                                        <?php echo htmlspecialchars(substr($msg->content, 0, 40)); ?>...
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </a>
+                                    <?php 
+                                            endif;
+                                        endforeach; 
+                                    endif; 
+                                    ?>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="col-md-8">
+                            <?php if ($other_user_id): ?>
+                                <?php 
+                                $other_user = R::load('user', $other_user_id);
+                                $messages = R::find('message', '(from_user_id = ? AND to_user_id = ?) OR (from_user_id = ? AND to_user_id = ?) ORDER BY created_at ASC',
+                                    [$current_user->id, $other_user_id, $other_user_id, $current_user->id]);
+                                
+                                $unread = R::find('message', 'from_user_id = ? AND to_user_id = ? AND is_read = 0', [$other_user_id, $current_user->id]);
+                                foreach ($unread as $msg) {
+                                    $msg->is_read = 1;
+                                    $msg->read_at = date('Y-m-d H:i:s');
+                                    R::store($msg);
+                                }
+                                ?>
+                                
+                                <div class="card border-0 shadow-sm chat-container">
+                                    <div class="card-header border-bottom">
+                                        <h5 class="card-title mb-0"><?php echo htmlspecialchars($other_user->first_name . ' ' . $other_user->last_name); ?></h5>
+                                        <small class="text-muted"><?php echo htmlspecialchars($other_user->city); ?></small>
+                                    </div>
+                                    
+                                    <div class="messages-area" id="messagesArea">
+                                        <?php foreach ($messages as $message): ?>
+                                            <div class="message <?php echo $message->from_user_id === $current_user->id ? 'sent' : 'received'; ?>">
+                                                <div class="message-content">
+                                                    <p class="mb-1"><?php echo nl2br(htmlspecialchars($message->content)); ?></p>
+                                                    <small><?php echo date('H:i', strtotime($message->created_at)); ?></small>
+                                                </div>
+                                            </div>
+                                        <?php endforeach; ?>
+                                    </div>
+
+                                    <div class="card-footer border-top">
+                                        <form method="POST" class="d-flex gap-2">
+                                            <input type="hidden" name="action" value="send_message">
+                                            <input type="hidden" name="to_user_id" value="<?php echo $other_user_id; ?>">
+                                            <input type="text" class="form-control" name="content" placeholder="Type a message..." required>
+                                            <button type="submit" class="btn btn-primary"><i class="bi bi-send"></i></button>
+                                        </form>
+                                    </div>
+                                </div>
+                            <?php else: ?>
+                                <div class="card border-0 shadow-sm d-flex align-items-center justify-content-center" style="height: 600px;">
+                                    <div class="text-center">
+                                        <i class="bi bi-chat-dots" style="font-size: 5rem; color: #ccc;"></i>
+                                        <p class="text-muted mt-3">Select a conversation to start messaging</p>
+                                    </div>
+                                </div>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        <!-- FAVORITES -->
+        <?php elseif ($action === 'favorites'): $page_title = 'Favorites - GlobePair'; requireLogin(); 
+            $my_favorites = R::find('favorite', 'user_id = ? ORDER BY created_at DESC', [$current_user->id]);
+            $received_favorites = R::find('favorite', 'favorite_user_id = ? ORDER BY created_at DESC', [$current_user->id]);
+        ?>
+            <div class="container-fluid py-4">
+                <div class="container">
+                    <h1 class="mb-4">My Likes & Admirers</h1>
+
+                    <ul class="nav nav-tabs mb-4" role="tablist">
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#my-likes" type="button" role="tab">
+                                <i class="bi bi-heart"></i> My Favorites (<?php echo count($my_favorites); ?>)
+                            </button>
+                        </li>
+                        <li class="nav-item" role="presentation">
+                            <button class="nav-link" data-bs-toggle="tab" data-bs-target="#admirers" type="button" role="tab">
+                                <i class="bi bi-heart-fill text-danger"></i> Admirers (<?php echo count($received_favorites); ?>)
+                            </button>
+                        </li>
+                    </ul>
+
+                    <div class="tab-content">
+                        <div class="tab-pane fade show active" id="my-likes" role="tabpanel">
+                            <?php if (empty($my_favorites)): ?>
+                                <div class="alert alert-info text-center py-5">
+                                    <i class="bi bi-heart" style="font-size: 3rem;"></i>
+                                    <p class="mt-3">You haven't liked anyone yet. <a href="?action=discover">Explore profiles</a></p>
+                                </div>
+                            <?php else: ?>
+                                <div class="row g-4">
+                                    <?php foreach ($my_favorites as $fav): 
+                                        $profile = R::load('user', $fav->favorite_user_id);
+                                        if (!$profile->is_admin):
+                                    ?>
+                                        <div class="col-md-6 col-lg-4">
+                                            <div class="card h-100 shadow-sm border-0 profile-card overflow-hidden">
+                                                <div class="profile-image">
+                                                    <?php if ($profile->profile_image): ?>
+                                                        <img src="<?php echo htmlspecialchars($profile->profile_image); ?>" alt="Profile">
+                                                    <?php else: ?>
+                                                        <div class="w-100 h-100 d-flex align-items-center justify-content-center text-white bg-gradient">
+                                                            <i class="bi bi-person-circle" style="font-size: 5rem;"></i>
+                                                        </div>
+                                                    <?php endif; ?>
+                                                </div>
+                                                <div class="card-body p-3">
+                                                    <h5 class="card-title mb-1"><?php echo htmlspecialchars($profile->first_name . ' ' . $profile->last_name); ?></h5>
+                                                    <p class="text-muted small mb-2"><i class="bi bi-geo-alt"></i> <?php echo htmlspecialchars($profile->city); ?></p>
+                                                </div>
+                                                <div class="card-footer bg-light border-top p-2">
+                                                    <a href="?action=view_profile&id=<?php echo $profile->id; ?>" class="btn btn-sm btn-outline-primary w-100"><i class="bi bi-eye"></i> View</a>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    <?php endif; endforeach; ?>
+                                </div>
+                            <?php endif; ?>
+                        </div>
+
+                        <div class="tab-pane fade" id="admirers" role="tabpanel">
+                            <?php if (empty($received_favorites)): ?>
+                                <div class="alert alert-info text-center py-5">
+                                    <i class="bi bi-heart-fill text-danger" style="font-size: 3rem;"></i>
+                                    <p class="mt-3">No one has liked your profile yet.</p>
+                                </div>
+                            <?php else: ?>
+                                <div class="row g-4">
+                                    <?php foreach ($received_favorites as $fav): 
+                                        $profile = R::load('user', $fav->user_id);
+                                        if (!$profile->is_admin):
+                                    ?>
+                                        <div class="col-md-6 col-lg-4">
+                                            <div class="card h-100 shadow-sm border-0 profile-card overflow-hidden">
+                                                <div class="profile-image position-relative">
+                                                    <?php if ($profile->profile_image): ?>
+                                                        <img src="<?php echo htmlspecialchars($profile->profile_image); ?>" alt="Profile">
+                                                    <?php else: ?>
+                                                        <div class="w-100 h-100 d-flex align-items-center justify-content-center text-white bg-gradient">
+                                                            <i class="bi bi-person-circle" style="font-size: 5rem;"></i>
+                                                        </div>
+                                                    <?php endif; ?>
+                                                    <span class="badge bg-danger position-absolute top-2 end-2"><i class="bi bi-heart-fill"></i></span>
+                                                </div>
+                                                <div class="card-body p-3">
+                                                    <h5 class="card-title mb-1"><?php echo htmlspecialchars($profile->first_name . ' ' . $profile->last_name); ?></h5>
+                                                    <p class="text-muted small mb-2"><i class="bi bi-geo-alt"></i> <?php echo htmlspecialchars($profile->city); ?></p>
+                                                </div>
+                                                <div class="card-footer bg-light border-top p-2">
+                                                    <div class="d-grid gap-2">
+                                                        <a href="?action=chat_redirect&user_id=<?php echo $profile->id; ?>" class="btn btn-sm btn-primary"><i class="bi bi-chat-dots"></i> Message</a>
+                                                        <a href="?action=view_profile&id=<?php echo $profile->id; ?>" class="btn btn-sm btn-outline-primary"><i class="bi bi-eye"></i> View</a>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    <?php endif; endforeach; ?>
+                                </div>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        <!-- MY PAYMENTS -->
+        <?php elseif ($action === 'my_payments'): $page_title = 'My Payments - GlobePair'; requireLogin();
+            $message_payments = R::find('messagepayment', 'user_id = ? ORDER BY created_at DESC', [$current_user->id]);
+            $premium_payments = R::find('payment', 'user_id = ? ORDER BY created_at DESC', [$current_user->id]);
+        ?>
+            <div class="container py-5">
+                <h1 class="mb-4">My Payments</h1>
+
+                <ul class="nav nav-tabs mb-4">
+                    <li class="nav-item">
+                        <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#msg-payments">Message Fees</button>
+                    </li>
+                    <li class="nav-item">
+                        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#prem-payments">Premium Payments</button>
+                    </li>
+                </ul>
+
+                <div class="tab-content">
+                    <div class="tab-pane fade show active" id="msg-payments">
+                        <?php if (empty($message_payments)): ?>
+                            <div class="alert alert-info">No message payments yet.</div>
+                        <?php else: ?>
+                            <div class="card border-0 shadow-sm">
+                                <div class="table-responsive">
+                                    <table class="table">
+                                        <thead class="table-light">
+                                            <tr>
+                                                <th>Date</th>
+                                                <th>Amount</th>
+                                                <th>Method</th>
+                                                <th>Status</th>
+                                                <th>Reference</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <?php foreach ($message_payments as $p): ?>
+                                                <tr>
+                                                    <td><?php echo date('M d, Y H:i', strtotime($p->created_at)); ?></td>
+                                                    <td><?php echo strtoupper($p->currency ?? 'KES') . ' ' . number_format($p->amount); ?></td>
+                                                    <td><?php echo ucfirst($p->payment_method); ?></td>
+                                                    <td>
+                                                        <span class="badge <?php echo $p->status === 'completed' ? 'bg-success' : ($p->status === 'pending' ? 'bg-warning text-dark' : 'bg-danger'); ?>">
+                                                            <?php echo ucfirst($p->status); ?>
+                                                        </span>
+                                                    </td>
+                                                    <td><small><?php echo htmlspecialchars($p->mpesa_receipt ?? $p->paypal_order_id ?? $p->reference ?? '-'); ?></small></td>
+                                                </tr>
+                                            <?php endforeach; ?>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+
+                    <div class="tab-pane fade" id="prem-payments">
+                        <?php if (empty($premium_payments)): ?>
+                            <div class="alert alert-info">No premium payments yet.</div>
+                        <?php else: ?>
+                            <div class="card border-0 shadow-sm">
+                                <div class="table-responsive">
+                                    <table class="table">
+                                        <thead class="table-light">
+                                            <tr>
+                                                <th>Date</th>
+                                                <th>Amount</th>
+                                                <th>Status</th>
+                                                <th>Receipt</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <?php foreach ($premium_payments as $p): ?>
+                                                <tr>
+                                                    <td><?php echo date('M d, Y H:i', strtotime($p->created_at)); ?></td>
+                                                    <td>KES <?php echo number_format($p->amount); ?></td>
+                                                    <td>
+                                                        <span class="badge <?php echo $p->status === 'completed' ? 'bg-success' : ($p->status === 'pending' ? 'bg-warning text-dark' : 'bg-danger'); ?>">
+                                                            <?php echo ucfirst($p->status); ?>
+                                                        </span>
+                                                    </td>
+                                                    <td><?php echo htmlspecialchars($p->mpesa_receipt ?? '-'); ?></td>
+                                                </tr>
+                                            <?php endforeach; ?>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </div>
+
+        <!-- EDIT PROFILE -->
+        <?php elseif ($action === 'edit_profile'): $page_title = 'Edit Profile - GlobePair'; requireLogin(); ?>
+            <div class="container py-5">
+                <div class="row justify-content-center">
+                    <div class="col-lg-8">
+                        <div class="card shadow-lg border-0">
+                            <div class="card-header bg-gradient text-white">
+                                <h3 class="mb-0 fw-bold"><i class="bi bi-pencil-square"></i> Edit Your Profile</h3>
+                            </div>
+                            <div class="card-body p-5">
+                                <form method="POST">
+                                    <input type="hidden" name="action" value="update_profile">
+                                    
+                                    <div class="row">
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">First Name *</label>
+                                            <input type="text" class="form-control" name="first_name" value="<?php echo htmlspecialchars($current_user->first_name); ?>" required>
+                                        </div>
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">Last Name *</label>
+                                            <input type="text" class="form-control" name="last_name" value="<?php echo htmlspecialchars($current_user->last_name); ?>" required>
+                                        </div>
+                                    </div>
+
+                                    <div class="row">
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">City *</label>
+                                            <input type="text" class="form-control" name="city" value="<?php echo htmlspecialchars($current_user->city); ?>" required>
+                                        </div>
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">Date of Birth *</label>
+                                            <input type="date" class="form-control" name="birth_date" value="<?php echo $current_user->birth_date; ?>" required>
+                                        </div>
+                                    </div>
+
+                                    <div class="row">
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">Gender *</label>
+                                            <select class="form-select" name="gender" required>
+                                                <option value="male" <?php echo $current_user->gender === 'male' ? 'selected' : ''; ?>>Male</option>
+                                                <option value="female" <?php echo $current_user->gender === 'female' ? 'selected' : ''; ?>>Female</option>
+                                                <option value="other" <?php echo $current_user->gender === 'other' ? 'selected' : ''; ?>>Other</option>
+                                            </select>
+                                        </div>
+                                    </div>
+
+                                    <div class="mb-4">
+                                        <label class="form-label">Bio</label>
+                                        <textarea class="form-control" name="bio" rows="5" placeholder="Tell others about yourself..."><?php echo htmlspecialchars($current_user->bio); ?></textarea>
+                                    </div>
+
+                                    <div class="d-grid gap-2">
+                                        <button type="submit" class="btn btn-primary btn-lg fw-bold"><i class="bi bi-check-circle"></i> Save Changes</button>
+                                        <a href="?action=dashboard" class="btn btn-secondary">Back to Dashboard</a>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        <!-- PREMIUM UPGRADE -->
+        <?php elseif ($action === 'premium'): $page_title = 'Premium - GlobePair'; requireLogin();
+            if ($current_user->user_role === 'premium') {
+                header('Location: ?action=dashboard');
+                exit;
+            }
+        ?>
+            <div class="container py-5">
+                <div class="row g-4">
+                    <div class="col-lg-6">
+                        <div class="card border-0 shadow-lg h-100">
+                            <div class="card-header bg-gradient text-white">
+                                <h3 class="mb-0 fw-bold"><i class="bi bi-star-fill"></i> Premium Benefits</h3>
+                            </div>
+                            <div class="card-body p-5">
+                                <ul class="list-unstyled">
+                                    <li class="mb-3 d-flex">
+                                        <i class="bi bi-check-circle-fill text-success me-3" style="font-size: 1.5rem;"></i>
+                                        <div>
+                                            <h6>Free Messaging with Premium Members</h6>
+                                            <small class="text-muted">No per-message fees when chatting with other premium users</small>
+                                        </div>
+                                    </li>
+                                    <li class="mb-3 d-flex">
+                                        <i class="bi bi-check-circle-fill text-success me-3" style="font-size: 1.5rem;"></i>
+                                        <div>
+                                            <h6>See Who Liked You</h6>
+                                            <small class="text-muted">Know who's interested in you</small>
+                                        </div>
+                                    </li>
+                                    <li class="mb-3 d-flex">
+                                        <i class="bi bi-check-circle-fill text-success me-3" style="font-size: 1.5rem;"></i>
+                                        <div>
+                                            <h6>Priority Profile Visibility</h6>
+                                            <small class="text-muted">Appear higher in search results</small>
+                                        </div>
+                                    </li>
+                                    <li class="d-flex">
+                                        <i class="bi bi-check-circle-fill text-success me-3" style="font-size: 1.5rem;"></i>
+                                        <div>
+                                            <h6>24/7 Priority Support</h6>
+                                            <small class="text-muted">Get help when you need it</small>
+                                        </div>
+                                    </li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="col-lg-6">
+                        <div class="card border-0 shadow-lg">
+                            <div class="card-header bg-success text-white">
+                                <h3 class="mb-0 fw-bold"><i class="bi bi-credit-card"></i> Upgrade Now</h3>
+                            </div>
+                            <div class="card-body p-5">
+                                <div class="mb-4">
+                                    <div class="d-flex justify-content-between mb-2 pb-2 border-bottom">
+                                        <span class="fw-bold">Monthly Premium</span>
+                                        <span class="fw-bold">KES <?php echo number_format(PREMIUM_PRICE); ?></span>
+                                    </div>
+                                    <div class="d-flex justify-content-between pt-2">
+                                        <span class="fw-bold">Total</span>
+                                        <span class="fw-bold text-success" style="font-size: 1.3rem;">KES <?php echo number_format(PREMIUM_PRICE); ?></span>
+                                    </div>
+                                </div>
+
+                                <form method="POST">
+                                    <input type="hidden" name="action" value="upgrade_premium">
+                                    
+                                    <div class="mb-4">
+                                        <label class="form-label fw-bold">Mpesa Phone Number</label>
+                                        <div class="input-group input-group-lg">
+                                            <span class="input-group-text bg-light border-end-0">+</span>
+                                            <input type="tel" class="form-control border-start-0" name="phone" placeholder="254712345678" pattern="254[0-9]{9}" required>
+                                        </div>
+                                        <small class="text-muted d-block mt-2">
+                                            <i class="bi bi-info-circle"></i> Enter your Kenyan phone number (format: 254712345678)
+                                        </small>
+                                    </div>
+
+                                    <button type="submit" class="btn btn-success btn-lg w-100 fw-bold mb-3">
+                                        <i class="bi bi-phone"></i> Pay with Mpesa
+                                    </button>
+
+                                    <div class="alert alert-info">
+                                        <i class="bi bi-shield-check"></i>
+                                        <small>Your payment is secure and processed by Safaricom Mpesa.</small>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        <!-- ADMIN PANEL -->
+        <?php elseif ($action === 'admin'): $page_title = 'Admin Panel - GlobePair'; requireAdmin();
+            $admin_search = sanitize($_GET['search'] ?? '');
+            $admin_status = sanitize($_GET['status'] ?? '');
+            $admin_page = max(1, intval($_GET['page'] ?? 1));
+            $admin_per_page = 20;
+
+            $admin_conditions = ['is_admin = 0'];
+            $admin_params = [0];
+
+            if ($admin_search) {
+                $admin_conditions[] = '(first_name LIKE ? OR last_name LIKE ? OR email LIKE ?)';
+                $s = '%' . $admin_search . '%';
+                $admin_params[] = $s; $admin_params[] = $s; $admin_params[] = $s;
+            }
+
+            if ($admin_status) {
+                $admin_conditions[] = 'status = ?';
+                $admin_params[] = $admin_status;
+            }
+
+            $admin_where = implode(' AND ', $admin_conditions);
+            $admin_users = R::find('user', $admin_where . ' ORDER BY created_at DESC LIMIT ? OFFSET ?',
+                array_merge($admin_params, [$admin_per_page, ($admin_page - 1) * $admin_per_page]));
+            $admin_total = R::count('user', $admin_where, $admin_params);
+            $admin_total_pages = ceil($admin_total / $admin_per_page);
+            
+            $stats = [
+                'total_users' => R::count('user', 'is_admin = 0'),
+                'active_users' => R::count('user', 'is_admin = 0 AND status = "active"'),
+                'inactive_users' => R::count('user', 'is_admin = 0 AND status = "inactive"'),
+                'premium_users' => R::count('user', 'is_admin = 0 AND user_role = "premium"'),
+                'total_messages' => R::count('message'),
+                'total_payments' => R::count('payment', 'status = "completed"') + R::count('messagepayment', 'status = "completed"'),
+            ];
+        ?>
+            <div class="container-fluid py-4">
+                <div class="container">
+                    <div class="d-flex justify-content-between align-items-center mb-4">
+                        <h1><i class="bi bi-shield-lock text-warning"></i> Admin Panel</h1>
+                        <a href="?action=dashboard" class="btn btn-outline-secondary">
+                            <i class="bi bi-arrow-left"></i> Back to Dashboard
+                        </a>
+                    </div>
+
+                    <!-- Stats -->
+                    <div class="row g-3 mb-5">
+                        <div class="col-md-2">
+                            <div class="card border-0 shadow-sm text-center p-3">
+                                <h6 class="text-muted">Total Users</h6>
+                                <h3 class="fw-bold text-primary"><?php echo $stats['total_users']; ?></h3>
+                            </div>
+                        </div>
+                        <div class="col-md-2">
+                            <div class="card border-0 shadow-sm text-center p-3">
+                                <h6 class="text-muted">Active</h6>
+                                <h3 class="fw-bold text-success"><?php echo $stats['active_users']; ?></h3>
+                            </div>
+                        </div>
+                        <div class="col-md-2">
+                            <div class="card border-0 shadow-sm text-center p-3">
+                                <h6 class="text-muted">Inactive</h6>
+                                <h3 class="fw-bold text-danger"><?php echo $stats['inactive_users']; ?></h3>
+                            </div>
+                        </div>
+                        <div class="col-md-2">
+                            <div class="card border-0 shadow-sm text-center p-3">
+                                <h6 class="text-muted">Premium</h6>
+                                <h3 class="fw-bold text-warning"><?php echo $stats['premium_users']; ?></h3>
+                            </div>
+                        </div>
+                        <div class="col-md-2">
+                            <div class="card border-0 shadow-sm text-center p-3">
+                                <h6 class="text-muted">Messages</h6>
+                                <h3 class="fw-bold text-info"><?php echo $stats['total_messages']; ?></h3>
+                            </div>
+                        </div>
+                        <div class="col-md-2">
+                            <div class="card border-0 shadow-sm text-center p-3">
+                                <h6 class="text-muted">Payments</h6>
+                                <h3 class="fw-bold text-secondary"><?php echo $stats['total_payments']; ?></h3>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- User Management -->
+                    <div class="card border-0 shadow-sm mb-4">
+                        <div class="card-header bg-dark text-white">
+                            <h4 class="mb-0"><i class="bi bi-people"></i> User Management</h4>
+                        </div>
+                        <div class="card-body p-4">
+                            <form method="GET" class="row g-3 mb-4">
+                                <input type="hidden" name="action" value="admin">
+                                <div class="col-md-4">
+                                    <input type="text" class="form-control" name="search" value="<?php echo htmlspecialchars($admin_search); ?>" placeholder="Search users...">
+                                </div>
+                                <div class="col-md-3">
+                                    <select class="form-select" name="status">
+                                        <option value="">All Status</option>
+                                        <option value="active" <?php echo $admin_status === 'active' ? 'selected' : ''; ?>>Active</option>
+                                        <option value="inactive" <?php echo $admin_status === 'inactive' ? 'selected' : ''; ?>>Inactive</option>
+                                    </select>
+                                </div>
+                                <div class="col-md-2">
+                                    <button type="submit" class="btn btn-primary w-100"><i class="bi bi-search"></i> Filter</button>
+                                </div>
+                            </form>
+
+                            <div class="table-responsive">
+                                <table class="table table-hover">
+                                    <thead class="table-light">
+                                        <tr>
+                                            <th>ID</th>
+                                            <th>Name</th>
+                                            <th>Email</th>
+                                            <th>Role</th>
+                                            <th>Status</th>
+                                            <th>Joined</th>
+                                            <th>Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <?php foreach ($admin_users as $u): ?>
+                                            <tr>
+                                                <td><?php echo $u->id; ?></td>
+                                                <td>
+                                                    <div class="d-flex align-items-center">
+                                                        <?php if ($u->profile_image): ?>
+                                                            <img src="<?php echo htmlspecialchars($u->profile_image); ?>" class="rounded-circle me-2" width="32" height="32" style="object-fit: cover;">
+                                                        <?php else: ?>
+                                                            <i class="bi bi-person-circle me-2" style="font-size: 1.5rem;"></i>
+                                                        <?php endif; ?>
+                                                        <?php echo htmlspecialchars($u->first_name . ' ' . $u->last_name); ?>
+                                                    </div>
+                                                </div?>
+                                                <td><?php echo htmlspecialchars($u->email); ?></td>
+                                                <td>
+                                                    <?php if ($u->user_role === 'premium'): ?>
+                                                        <span class="badge bg-warning"><i class="bi bi-star-fill"></i> Premium</span>
+                                                    <?php else: ?>
+                                                        <span class="badge bg-secondary">Regular</span>
+                                                    <?php endif; ?>
+                                                </div?>
+                                                <td>
+                                                    <span class="badge <?php echo $u->status === 'active' ? 'bg-success' : 'bg-danger'; ?>">
+                                                        <i class="bi bi-circle-fill" style="font-size: 0.5rem;"></i> 
+                                                        <?php echo ucfirst($u->status); ?>
+                                                    </span>
+                                                 </div?>
+                                                <td><?php echo date('M d, Y', strtotime($u->created_at)); ?></div?>
+                                                <td>
+                                                    <form method="POST" class="d-inline">
+                                                        <input type="hidden" name="action" value="toggle_status">
+                                                        <input type="hidden" name="user_id" value="<?php echo $u->id; ?>">
+                                                        <input type="hidden" name="new_status" value="<?php echo $u->status === 'active' ? 'inactive' : 'active'; ?>">
+                                                        <button type="submit" class="btn btn-sm <?php echo $u->status === 'active' ? 'btn-outline-danger' : 'btn-outline-success'; ?>" 
+                                                                onclick="return confirm('Are you sure you want to <?php echo $u->status === 'active' ? 'deactivate' : 'activate'; ?> this user?')">
+                                                            <i class="bi bi-<?php echo $u->status === 'active' ? 'pause-circle' : 'play-circle'; ?>"></i>
+                                                            <?php echo $u->status === 'active' ? 'Deactivate' : 'Activate'; ?>
+                                                        </button>
+                                                    </form>
+                                                 </div?>
+                                             </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <?php if ($admin_total_pages > 1): ?>
+                                <nav>
+                                    <ul class="pagination justify-content-center">
+                                        <?php for ($i = 1; $i <= $admin_total_pages; $i++): ?>
+                                            <li class="page-item <?php echo $i === $admin_page ? 'active' : ''; ?>">
+                                                <a class="page-link" href="?action=admin&page=<?php echo $i; ?>&search=<?php echo urlencode($admin_search); ?>&status=<?php echo urlencode($admin_status); ?>"><?php echo $i; ?></a>
+                                            </li>
+                                        <?php endfor; ?>
+                                    </ul>
+                                </nav>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        <?php endif; ?>
+    </main>
+
+    <!-- Footer -->
+    <footer class="mt-5">
+        <div class="container text-center">
+            <p class="mb-0">&copy; 2024 GlobePair. Find your perfect match today. All rights reserved.</p>
+        </div>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Auto-dismiss alerts
+            document.querySelectorAll('.alert').forEach(alert => {
+                setTimeout(() => {
+                    const bsAlert = new bootstrap.Alert(alert);
+                    bsAlert.close();
+                }, 5000);
+            });
+
+            // Auto-scroll chat to bottom on load
+            const msgArea = document.getElementById('messagesArea');
+            if(msgArea) {
+                msgArea.scrollTop = msgArea.scrollHeight;
+            }
+
+            // Photo Upload Preview
+            const photoInput = document.getElementById('profilePhotoInput');
+            const photoPreview = document.getElementById('photoPreview');
+            const photoPlaceholder = document.getElementById('photoPlaceholder');
+            const fileNameDiv = document.getElementById('fileName');
+            const fileNameText = document.getElementById('fileNameText');
+            const removePhotoBtn = document.getElementById('removePhoto');
+
+            if (photoInput) {
+                photoInput.addEventListener('change', function(e) {
+                    const file = e.target.files[0];
+                    
+                    if (file) {
+                        const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+                        if (!allowedTypes.includes(file.type)) {
+                            alert('Invalid file type. Please select JPG, PNG, GIF, or WebP.');
+                            this.value = '';
+                            return;
+                        }
+                        
+                        if (file.size > 5 * 1024 * 1024) {
+                            alert('File size must be less than 5MB.');
+                            this.value = '';
+                            return;
+                        }
+                        
+                        const reader = new FileReader();
+                        reader.onload = function(event) {
+                            photoPreview.src = event.target.result;
+                            photoPreview.style.display = 'block';
+                            photoPlaceholder.style.display = 'none';
+                        }
+                        reader.readAsDataURL(file);
+                        
+                        fileNameText.textContent = file.name;
+                        fileNameDiv.style.display = 'block';
+                    }
+                });
+
+                if (removePhotoBtn) {
+                    removePhotoBtn.addEventListener('click', function() {
+                        photoInput.value = '';
+                        photoPreview.src = '';
+                        photoPreview.style.display = 'none';
+                        photoPlaceholder.style.display = 'flex';
+                        fileNameDiv.style.display = 'none';
+                    });
+                }
+            }
+
+            // Payment option selection
+            document.querySelectorAll('.payment-option').forEach(option => {
+                option.addEventListener('click', function(e) {
+                    if (e.target.tagName !== 'INPUT' && e.target.tagName !== 'BUTTON') {
+                        document.querySelectorAll('.payment-option').forEach(o => o.classList.remove('active'));
+                        this.classList.add('active');
+                    }
+                });
+            });
+        });
+    </script>
+</body>
+</html>
